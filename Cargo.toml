@@ -1,0 +1,28 @@
+[package]
+name = "ssh-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies.russh]
+version = "0.57"
+default-features = false
+features = ["ring"]
+
+[dependencies.tokio]
+version = "1.49"
+features = ["full"]
+
+[dependencies.libc]
+version = "0.2"
+
+[dependencies.anyhow]
+version = "1.0"
+
+[dependencies.async-trait]
+version = "0.1"
+
+[dependencies.uzers]
+version = "0.12"
+
+[dependencies.nix]
+version = "0.27"
