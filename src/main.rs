@@ -364,9 +364,21 @@ impl Handler for Connection {
         &mut self,
         channel: russh::ChannelId,
         data: &[u8],
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
         debug!("Received {} bytes on channel {}", data.len(), channel);
+
+        // Check for "exit" command
+        let data_str = String::from_utf8_lossy(data);
+        let trimmed = data_str.trim();
+
+        if trimmed == "exit" || trimmed.starts_with("exit\r") || trimmed.starts_with("exit\n") {
+            info!("Exit command received on channel {}", channel);
+            session.close(channel)?;
+            info!("Channel {} closed", channel);
+            return Ok(());
+        }
+
         let mut stdin = self.stdin.lock().await;
         let Some(stdin) = stdin.as_mut() else {
             warn!(
