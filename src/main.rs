@@ -68,15 +68,15 @@ async fn main() -> anyhow::Result<()> {
     loop {
         let (stream, addr) = listener.accept().await?;
         let ip = addr.ip();
-        info!("New connection from {}", ip);
+        info!("New connection from {ip}");
 
         let username = match db.connected(ip) {
             Ok(username) => {
-                info!("Connection from {} registered", ip);
+                info!("Connection from {ip} registered");
                 username
             }
             Err(e) => {
-                error!("Connection rejected from {}: {}", ip, e);
+                error!("Connection rejected from {ip}: {e}");
                 continue;
             }
         };
@@ -84,13 +84,13 @@ async fn main() -> anyhow::Result<()> {
         let config = config.clone();
         let db = db.clone();
         tokio::spawn(async move {
-            debug!("Starting SSH session handler for {}", ip);
+            debug!("Starting SSH session handler for {ip}");
             russh::server::run_stream(config, stream, Connection::new(username))
                 .await?
                 .await?;
-            info!("SSH session ended for {}", ip);
+            info!("SSH session ended for {ip}");
             db.disconnected(ip);
-            info!("Disconnected {}", ip);
+            info!("Disconnected {ip}");
             Result::<(), anyhow::Error>::Ok(())
         });
     }
@@ -125,26 +125,26 @@ impl Handler for Connection {
     type Error = anyhow::Error;
 
     async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
-        info!("Authentication attempt for user: {}", user);
+        info!("Authentication attempt for user: {user}");
 
         if let Err(e) = self.username.set(user) {
-            warn!("Authentication failed for user {}: {}", user, e);
+            warn!("Authentication failed for user {user}: {e}");
             return Ok(Auth::reject());
         };
 
         if let None = uzers::get_user_by_name(user) {
-            info!("User {} does not exist, creating...", user);
+            info!("User {user} does not exist, creating...");
             let status = Command::new("useradd").arg("-m").arg(user).status().await?;
             if !status.success() {
-                error!("useradd failed for user {}", user);
+                error!("useradd failed for user {user}");
                 anyhow::bail!("useradd failed");
             }
-            info!("User {} created successfully", user);
+            info!("User {user} created successfully");
         } else {
-            info!("User {} already exists", user);
+            info!("User {user} already exists");
         }
 
-        info!("Authentication accepted for user {}", user);
+        info!("Authentication accepted for user {user}");
         Ok(Auth::Accept)
     }
 
@@ -160,8 +160,7 @@ impl Handler for Connection {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         info!(
-            "PTY request for channel {}: term={}, cols={}, rows={}",
-            channel, term, col_width, row_height
+            "PTY request for channel {channel}: term={term}, cols={col_width}, rows={row_height}",
         );
 
         self.pty_size = Some(Winsize {
@@ -173,7 +172,7 @@ impl Handler for Connection {
         self.pty_term = Some(term.to_string());
         session.channel_success(channel)?;
 
-        info!("PTY allocated successfully for channel {}", channel);
+        info!("PTY allocated successfully for channel {channel}");
         Ok(())
     }
 
@@ -186,10 +185,7 @@ impl Handler for Connection {
         pix_height: u32,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        info!(
-            "Window change request for channel {}: cols={}, rows={}",
-            channel, col_width, row_height
-        );
+        info!("Window change request for channel {channel}: cols={col_width}, rows={row_height}",);
 
         // attempt to resize PTY if we have a master fd
         if let Some(fd) = self.pty_master_fd {
@@ -203,12 +199,9 @@ impl Handler for Connection {
             unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws) };
             self.pty_size = Some(ws);
             session.channel_success(channel)?;
-            debug!("Window resized for channel {}", channel);
+            debug!("Window resized for channel {channel}");
         } else {
-            warn!(
-                "Window change requested but no master fd available for channel {}",
-                channel
-            );
+            warn!("Window change requested but no master fd available for channel {channel}",);
             session.channel_failure(channel)?;
             // TODO
         }
@@ -221,27 +214,21 @@ impl Handler for Connection {
         session: &mut Session,
     ) -> Result<bool, Self::Error> {
         let channel_id = channel.id();
-        info!("Channel open session request for channel {}", channel_id);
+        info!("Channel open session request for channel {channel_id}");
 
         let Some(user) = self.username.get() else {
-            warn!(
-                "Channel open session failed: no username set for channel {}",
-                channel_id
-            );
+            warn!("Channel open session failed: no username set for channel {channel_id}",);
             return Ok(false);
         };
         let Some(user) = uzers::get_user_by_name(&*user) else {
-            warn!(
-                "Channel open session failed: user not found for channel {}",
-                channel_id
-            );
+            warn!("Channel open session failed: user not found for channel {channel_id}",);
             return Ok(false);
         };
         let home = user.home_dir().to_owned();
 
         // allocate a PTY for interactive session using requested size if any
         let OpenptyResult { master, slave } = nix::pty::openpty(self.pty_size.as_ref(), None)?;
-        debug!("PTY allocated: master={:?}, slave={:?}", master, slave);
+        debug!("PTY allocated: master={master:?}, slave={slave:?}");
 
         // SAFETY: TODO
         match unsafe { fork()? } {
@@ -261,10 +248,8 @@ impl Handler for Connection {
                 let gid_raw = user.primary_group_id();
                 let uid_raw = user.uid();
                 info!(
-                    "CHILD - Setting privileges for user: {:?} (uid={}, gid={})",
+                    "CHILD - Setting privileges for user: {:?} (uid={uid_raw}, gid={gid_raw})",
                     user.name(),
-                    uid_raw,
-                    gid_raw
                 );
                 // SAFETY: TODO
                 unsafe { libc::initgroups(uname.as_ptr(), gid_raw as libc::gid_t) };
@@ -307,7 +292,7 @@ impl Handler for Connection {
                 std::process::exit(1);
             }
             ForkResult::Parent { child } => {
-                info!("PRENT - Child process spawned with pid={}", child);
+                info!("PRENT - Child process spawned with pid={child}",);
 
                 let master = std::fs::File::from(master);
                 let write = tokio::fs::File::from_std(master);
@@ -315,10 +300,7 @@ impl Handler for Connection {
                 let read_fd = read.as_raw_fd();
 
                 // Forward pty master output to SSH channel
-                info!(
-                    "PRENT - Starting output forwarder for channel {}",
-                    channel_id
-                );
+                info!("PRENT - Starting output forwarder for channel {channel_id}",);
                 forward(channel.id(), session.handle(), read);
 
                 // Store write as stdin writer (writes go to master)
@@ -330,13 +312,13 @@ impl Handler for Connection {
                 // Reap child in background to avoid zombies
                 tokio::task::spawn_blocking(move || {
                     let _ = nix::sys::wait::waitpid(child, None);
-                    info!("PRENT - Child process {} reaped", child);
+                    info!("PRENT - Child process {child} reaped");
                 });
             }
         }
 
         session.channel_success(channel.id())?;
-        info!("PRENT - Channel {} session opened successfully", channel_id);
+        info!("PRENT - Channel {channel_id} session opened successfully");
         Ok(true)
     }
 
@@ -346,54 +328,39 @@ impl Handler for Connection {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        debug!("Received {} bytes on channel {}", data.len(), channel);
-
-        // Check for "exit" command
-        let data_str = String::from_utf8_lossy(data);
-        let trimmed = data_str.trim();
-
-        if trimmed == "exit" || trimmed.starts_with("exit\r") || trimmed.starts_with("exit\n") {
-            info!("Exit command received on channel {}", channel);
-            session.close(channel)?;
-            info!("Channel {} closed", channel);
-            return Ok(());
+        // Close channel when exit is received
+        let cmd = std::str::from_utf8(data).map(str::trim);
+        if cmd == Ok("exit") {
+            info!("Exit command received on channel {channel}");
+            session.disconnect(russh::Disconnect::ByApplication, "User requested exit", "")?;
+            return Err(russh::Error::Disconnect.into());
         }
 
         let mut stdin = self.stdin.lock().await;
         let Some(stdin) = stdin.as_mut() else {
-            warn!(
-                "Data received but no stdin available for channel {}",
-                channel
-            );
+            warn!("Data received but no stdin available for channel {channel}",);
             return Ok(());
         };
         stdin.write_all(data).await?;
         stdin.flush().await?;
-        debug!("Data flushed to stdin on channel {}", channel);
         Ok(())
     }
 }
 
 fn forward<R: AsyncRead + Unpin + Send + 'static>(id: ChannelId, handle: Handle, reader: R) {
     tokio::spawn(async move {
-        debug!("Output forwarder started for channel {}", id);
+        debug!("Output forwarder started for channel {id}");
         let mut reader = BufReader::new(reader);
         let mut buf = vec![0u8; 1024];
         loop {
-            match reader.read(&mut buf).await {
-                Ok(0) => {
-                    debug!("Output forwarder EOF on channel {}", id);
-                    break;
-                }
-                Err(e) => {
-                    error!("Output forwarder error on channel {}: {}", id, e);
-                    break;
-                }
-                Ok(n) => {
-                    debug!("Forwarding {} bytes on channel {}", n, id);
-                    let _ = handle.data(id, CryptoVec::from(&buf[..n])).await;
-                }
+            let res = reader.read(&mut buf).await;
+            if let Err(e) = res {
+                error!("Output forwarder error on channel {id}: {e}");
             }
+            let _ = match res {
+                Ok(0) | Err(e) => break,
+                Ok(n) => handle.data(id, CryptoVec::from(&buf[..n])).await,
+            };
         }
         info!("Output forwarder ended for channel {}", id);
     });
