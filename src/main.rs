@@ -286,6 +286,21 @@ impl Handler for Connection {
                 let _ = dup2(slave_fd, 2);
                 debug!("CHILD - stdio redirected to slave PTY");
 
+                // SAFETY: TODO
+                unsafe {
+                    // Setup environment variables for the child process
+                    std::env::remove_var("SSH_ASKPASS");
+                    std::env::set_var("HOME", &home);
+                    std::env::set_var("USER", user.name());
+                    std::env::set_var("LOGNAME", user.name());
+                    std::env::set_var("SHELL", user.shell());
+
+                    // Set TERM if provided in PTY request
+                    if let Some(ref term) = self.pty_term {
+                        std::env::set_var("TERM", term);
+                    }
+                }
+
                 // Change to user's home directory
                 let _ = std::env::set_current_dir(&home);
                 debug!("CHILD - Changed working directory to {}", home.display());
@@ -296,7 +311,6 @@ impl Handler for Connection {
                 let arg0 = CString::new(shell_path).unwrap();
                 let arg1 = CString::new("-i").unwrap();
                 let args = [arg0.as_c_str(), arg1.as_c_str()];
-                info!("CHILD - Executing shell: {}", String::from_utf8_lossy(shell_path));
                 let _ = execv(shell.as_c_str(), &args);
 
                 error!("CHILD - execv failed, exiting child");
