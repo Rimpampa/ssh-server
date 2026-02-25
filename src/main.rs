@@ -12,7 +12,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::OnceCell;
 
 use russh::keys::PrivateKey;
-use russh::keys::ssh_key::rand_core::OsRng;
 use russh::server::{Auth, Handle, Handler, Msg, Session};
 use russh::{Channel, ChannelId, CryptoVec};
 
@@ -25,15 +24,19 @@ use uzers::os::unix::UserExt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let key = std::env::args().nth(1).with_context(|| "Missing key")?;
+    let key = tokio::fs::read_to_string(key).await?;
+    let key = PrivateKey::from_openssh(key)?;
+
     let config = Arc::new(russh::server::Config {
-        keys: vec![PrivateKey::random(&mut OsRng, russh::keys::Algorithm::Ed25519)?],
+        keys: vec![key],
         auth_rejection_time: Duration::from_secs(0),
         auth_rejection_time_initial: Some(Duration::from_secs(0)),
         inactivity_timeout: Some(Duration::from_secs(3600)),
         ..Default::default()
     });
 
-    let listener = TcpListener::bind(("0.0.0.0", 2222)).await?;
+    let listener = TcpListener::bind("0.0.0.0:2222").await?;
     println!("Listening on 0.0.0.0:2222");
 
     let db = Database::new();
