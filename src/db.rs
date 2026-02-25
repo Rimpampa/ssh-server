@@ -48,6 +48,11 @@ impl Database {
     }
 
     pub fn authorized(&self, ip: IpAddr, user: &str) -> anyhow::Result<()> {
+        let user = user.trim();
+        if user == "root" {
+            anyhow::bail!("root login is not allowed!")
+        }
+
         let lock = self.inner.lock().unwrap();
         if let Some(pos) = lock.iter().position(|e| e.user() == Some(user)) {
             anyhow::bail!(
