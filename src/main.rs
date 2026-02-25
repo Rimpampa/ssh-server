@@ -1,14 +1,12 @@
 // mod pty;
 
-mod username;
-
 mod db;
 use db::Database;
 
 use anyhow::Context;
-use username::Username;
 
 use std::ffi::CString;
+use std::net::IpAddr;
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,11 +68,8 @@ async fn main() -> anyhow::Result<()> {
         let ip = addr.ip();
         info!("New connection from {ip}");
 
-        let username = match db.connected(ip) {
-            Ok(username) => {
-                info!("Connection from {ip} registered");
-                username
-            }
+        match db.connected(ip) {
+            Ok(()) => info!("Connection from {ip} registered"),
             Err(e) => {
                 error!("Connection rejected from {ip}: {e}");
                 continue;
@@ -85,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
         let db = db.clone();
         tokio::spawn(async move {
             debug!("Starting SSH session handler for {ip}");
-            russh::server::run_stream(config, stream, Connection::new(username))
+            russh::server::run_stream(config, stream, Connection::new(db.clone(), ip))
                 .await?
                 .await?;
             info!("SSH session ended for {ip}");
@@ -98,7 +93,8 @@ async fn main() -> anyhow::Result<()> {
 
 #[derive(Clone)]
 struct Connection {
-    username: Username,
+    db: Database,
+    ip: IpAddr,
     // child's stdin as an async file (parent writes to this to send data to child)
     stdin: Arc<Mutex<Option<tokio::fs::File>>>,
     // PTY negotiated size (cols, rows)
@@ -110,9 +106,10 @@ struct Connection {
 }
 
 impl Connection {
-    fn new(username: Username) -> Self {
+    fn new(db: Database, ip: IpAddr) -> Self {
         Self {
-            username,
+            db,
+            ip,
             stdin: Default::default(),
             pty_size: None,
             pty_term: None,
@@ -127,7 +124,7 @@ impl Handler for Connection {
     async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
         info!("Authentication attempt for user: {user}");
 
-        if let Err(e) = self.username.set(user) {
+        if let Err(e) = self.db.authorized(self.ip, user) {
             warn!("Authentication failed for user {user}: {e}");
             return Ok(Auth::reject());
         };
@@ -216,7 +213,7 @@ impl Handler for Connection {
         let channel_id = channel.id();
         info!("Channel open session request for channel {channel_id}");
 
-        let Some(user) = self.username.get() else {
+        let Some(user) = self.db.user(self.ip) else {
             warn!("Channel open session failed: no username set for channel {channel_id}",);
             return Ok(false);
         };
@@ -354,11 +351,11 @@ fn forward<R: AsyncRead + Unpin + Send + 'static>(id: ChannelId, handle: Handle,
         let mut buf = vec![0u8; 1024];
         loop {
             let res = reader.read(&mut buf).await;
-            if let Err(e) = res {
+            if let Err(e) = &res {
                 error!("Output forwarder error on channel {id}: {e}");
             }
             let _ = match res {
-                Ok(0) | Err(e) => break,
+                Ok(0) | Err(_) => break,
                 Ok(n) => handle.data(id, CryptoVec::from(&buf[..n])).await,
             };
         }

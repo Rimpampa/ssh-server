@@ -1,10 +1,24 @@
-use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::OnceCell;
+
+struct Entry {
+    ip: IpAddr,
+    user: OnceCell<String>,
+    connected: bool,
+}
+
+impl Entry {
+    fn user(&self) -> Option<&str> {
+        self.user.get().map(String::as_str)
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Database {
-    inner: Arc<Mutex<HashMap<IpAddr, Entry>>>,
+    // sequential search is suboptimal but this server shouldn't ever expirience more than 20 users
+    inner: Arc<Mutex<Vec<Entry>>>,
 }
 
 impl Database {
@@ -12,24 +26,53 @@ impl Database {
         Default::default()
     }
 
-    pub fn connected(&self, ip: IpAddr) -> anyhow::Result<crate::Username> {
+    pub fn connected(&self, ip: IpAddr) -> anyhow::Result<()> {
         let mut lock = self.inner.lock().unwrap();
-        let entry = lock.entry(ip).or_insert_with(Default::default);
-        anyhow::ensure!(
-            !entry.connected,
-            "Rejecting new connection from {ip}: already connected"
-        );
-        entry.connected = true;
-        Ok(entry.username.clone())
+        match lock.iter().position(|e| e.ip == ip) {
+            Some(pos) if lock[pos].connected => {
+                anyhow::bail!("Rejecting new connection from {ip}: already connected");
+            }
+            Some(pos) => {
+                lock[pos].connected = true;
+                Ok(())
+            }
+            None => {
+                lock.push(Entry {
+                    ip,
+                    user: OnceCell::new(),
+                    connected: true,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    pub fn authorized(&self, ip: IpAddr, user: &str) -> anyhow::Result<()> {
+        let lock = self.inner.lock().unwrap();
+        if let Some(pos) = lock.iter().position(|e| e.user() == Some(user)) {
+            anyhow::bail!(
+                "Rejecting new connection from {user}@{ip}: already logged-in from {}",
+                lock[pos].ip
+            );
+        };
+        let Some(pos) = lock.iter().position(|e| e.ip == ip) else {
+            anyhow::bail!("*should be impossible to see this*")
+        };
+        lock[pos].user.set(user.to_string()).map_err(Into::into)
     }
 
     pub fn disconnected(&self, ip: IpAddr) {
-        self.inner.lock().unwrap().get_mut(&ip).unwrap().connected = false;
+        let mut lock = self.inner.lock().unwrap();
+        let Some(pos) = lock.iter().position(|e| e.ip == ip) else {
+            unreachable!()
+        };
+        lock[pos].connected = false;
     }
-}
 
-#[derive(Clone, Default)]
-struct Entry {
-    connected: bool,
-    username: crate::Username,
+    pub fn user(&self, ip: IpAddr) -> Option<String> {
+        let lock = self.inner.lock().unwrap();
+        lock.iter()
+            .find_map(|e| (e.ip == ip).then(|| e.user()).flatten())
+            .map(|s| s.to_string())
+    }
 }
