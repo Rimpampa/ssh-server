@@ -1,11 +1,15 @@
+// mod pty;
+
 mod username;
-use anyhow::Context;
-use username::Username;
 
 mod db;
 use db::Database;
 
-use std::os::fd::{AsRawFd, FromRawFd};
+use anyhow::Context;
+use username::Username;
+
+use std::ffi::CString;
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,7 +17,6 @@ use russh::keys::PrivateKey;
 use russh::server::{Auth, Handle, Handler, Msg, Session};
 use russh::{Channel, ChannelId, CryptoVec};
 
-use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::Command;
@@ -22,10 +25,9 @@ use tokio::sync::Mutex;
 use uzers::os::unix::UserExt;
 
 use libc;
-use nix::pty::Winsize;
-use nix::unistd::{ForkResult, close, dup, dup2, execv, fork, setsid};
-use nix::unistd::{Gid, Uid, setgid, setuid};
-use std::ffi::CString;
+
+use nix::pty::{OpenptyResult, Winsize};
+use nix::unistd::{ForkResult, Gid, Uid, dup2, execv, fork, setgid, setsid, setuid};
 
 use log::{debug, error, info, warn};
 
@@ -83,7 +85,9 @@ async fn main() -> anyhow::Result<()> {
         let db = db.clone();
         tokio::spawn(async move {
             debug!("Starting SSH session handler for {}", ip);
-            russh::server::run_stream(config, stream, Connection::new(username)).await?.await?;
+            russh::server::run_stream(config, stream, Connection::new(username))
+                .await?
+                .await?;
             info!("SSH session ended for {}", ip);
             db.disconnected(ip);
             info!("Disconnected {}", ip);
@@ -103,8 +107,6 @@ struct Connection {
     pty_term: Option<String>,
     // raw master fd for ioctl window changes (use duplicated fd)
     pty_master_fd: Option<i32>,
-    // Keep PTY alive to prevent fd from being closed
-    _pty: Arc<Mutex<Option<nix::pty::OpenptyResult>>>,
 }
 
 impl Connection {
@@ -115,7 +117,6 @@ impl Connection {
             pty_size: None,
             pty_term: None,
             pty_master_fd: None,
-            _pty: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -239,27 +240,20 @@ impl Handler for Connection {
         let home = user.home_dir().to_owned();
 
         // allocate a PTY for interactive session using requested size if any
-        let pty = nix::pty::openpty(self.pty_size.as_ref(), None)?;
-        let master_fd = pty.master.as_raw_fd();
-        let slave_fd = pty.slave.as_raw_fd();
-        debug!(
-            "PTY allocated: master_fd={}, slave_fd={}",
-            master_fd, slave_fd
-        );
-
-        // Store PTY to keep it alive throughout the session
-        *self._pty.lock().await = Some(pty);
+        let OpenptyResult { master, slave } = nix::pty::openpty(self.pty_size.as_ref(), None)?;
+        debug!("PTY allocated: master={:?}, slave={:?}", master, slave);
 
         // SAFETY: TODO
         match unsafe { fork()? } {
             ForkResult::Child => {
+                let slave = slave.into_raw_fd();
                 debug!("CHILD - Child process started");
                 // Child: become session leader and set up slave PTY as controlling terminal
                 let _ = setsid();
 
                 // set controlling tty
                 // SAFETY: TODO
-                unsafe { libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) };
+                unsafe { libc::ioctl(slave, libc::TIOCSCTTY, 0) };
                 debug!("CHILD - Set controlling tty");
 
                 // Drop privileges: initgroups, setgid, setuid
@@ -278,13 +272,9 @@ impl Handler for Connection {
                 let _ = setuid(Uid::from_raw(uid_raw));
 
                 // Redirect stdio to slave PTY
-                debug!("CHILD - dup2(slave_fd, 0)");
-                let _ = dup2(slave_fd, 0);
-                debug!("CHILD - dup2(slave_fd, 1)");
-                let _ = dup2(slave_fd, 1);
-                debug!("CHILD - dup2(slave_fd, 2)");
-                let _ = dup2(slave_fd, 2);
-                debug!("CHILD - stdio redirected to slave PTY");
+                let _ = dup2(slave, 0);
+                let _ = dup2(slave, 1);
+                let _ = dup2(slave, 2);
 
                 // SAFETY: TODO
                 unsafe {
@@ -318,27 +308,17 @@ impl Handler for Connection {
             }
             ForkResult::Parent { child } => {
                 info!("PRENT - Child process spawned with pid={}", child);
-                // Parent: close slave fd and forward IO on master fd
-                let _ = close(slave_fd);
 
-                // Duplicate master fd: one fd for reading/forwarding, one for writing
-                let read_fd = dup(master_fd)?;
-                let write_fd = dup(master_fd)?;
-                debug!(
-                    "PRENT - Duplicated master fd: read_fd={}, write_fd={}",
-                    read_fd, write_fd
-                );
-
-                // SAFETY: TODO
-                let read = unsafe { std::fs::File::from_raw_fd(read_fd) };
-                // SAFETY: TODO
-                let write = unsafe { std::fs::File::from_raw_fd(write_fd) };
-
-                let read = fs::File::from_std(read);
-                let write = fs::File::from_std(write);
+                let master = std::fs::File::from(master);
+                let write = tokio::fs::File::from_std(master);
+                let read = write.try_clone().await?;
+                let read_fd = read.as_raw_fd();
 
                 // Forward pty master output to SSH channel
-                info!("PRENT - Starting output forwarder for channel {}", channel_id);
+                info!(
+                    "PRENT - Starting output forwarder for channel {}",
+                    channel_id
+                );
                 forward(channel.id(), session.handle(), read);
 
                 // Store write as stdin writer (writes go to master)
