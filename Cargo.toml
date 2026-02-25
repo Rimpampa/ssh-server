@@ -27,3 +27,9 @@ version = "0.12"
 [dependencies.nix]
 version = "0.27"
 features = ["term", "process", "fs", "user"]
+
+[dependencies.log]
+version = "0.4"
+
+[dependencies.env_logger]
+version = "0.11"
