@@ -5,25 +5,35 @@ use username::Username;
 mod db;
 use db::Database;
 
-use std::process::Stdio;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::OnceCell;
 
 use russh::keys::PrivateKey;
 use russh::server::{Auth, Handle, Handler, Msg, Session};
 use russh::{Channel, ChannelId, CryptoVec};
 
-use tokio::io::BufReader;
+use tokio::fs;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::process::{ChildStdin, Command};
+use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use uzers::os::unix::UserExt;
 
+use libc;
+use nix::pty::Winsize;
+use nix::unistd::{ForkResult, close, dup, dup2, execv, fork, setsid};
+use nix::unistd::{Gid, Uid, setgid, setuid};
+use std::ffi::CString;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Ensure we can change uid/gid — this server must run as root to start sessions as other users
+    if !nix::unistd::Uid::effective().is_root() {
+        anyhow::bail!("Server must be run as root to spawn shells as other users");
+    }
+
     let key = std::env::args().nth(1).with_context(|| "Missing key")?;
     let key = tokio::fs::read_to_string(key).await?;
     let key = PrivateKey::from_openssh(key)?;
@@ -64,9 +74,16 @@ async fn main() -> anyhow::Result<()> {
 #[derive(Clone)]
 struct Connection {
     username: Username,
-    // here a tokio mutex is needed because the lock to child stdin needs to be held
-    // across await points, and the standard mutex doesn't support that (!Send)
-    stdin: Arc<Mutex<OnceCell<ChildStdin>>>,
+    // child's stdin as an async file (parent writes to this to send data to child)
+    stdin: Arc<Mutex<Option<tokio::fs::File>>>,
+    // PTY negotiated size (cols, rows)
+    pty_size: Option<Winsize>,
+    // terminal name (TERM)
+    pty_term: Option<String>,
+    // raw master fd for ioctl window changes (use duplicated fd)
+    pty_master_fd: Option<i32>,
+    // Keep PTY alive to prevent fd from being closed
+    _pty: Arc<Mutex<Option<nix::pty::OpenptyResult>>>,
 }
 
 impl Connection {
@@ -74,6 +91,10 @@ impl Connection {
         Self {
             username,
             stdin: Default::default(),
+            pty_size: None,
+            pty_term: None,
+            pty_master_fd: None,
+            _pty: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -96,41 +117,145 @@ impl Handler for Connection {
         Ok(Auth::Accept)
     }
 
+    async fn pty_request(
+        &mut self,
+        channel: ChannelId,
+        term: &str,
+        col_width: u32,
+        row_height: u32,
+        pix_width: u32,
+        pix_height: u32,
+        _modes: &[(russh::Pty, u32)],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.pty_size = Some(Winsize {
+            ws_row: row_height as u16,
+            ws_col: col_width as u16,
+            ws_xpixel: pix_width as u16,
+            ws_ypixel: pix_height as u16,
+        });
+        self.pty_term = Some(term.to_string());
+        session.channel_success(channel)?;
+        Ok(())
+    }
+
+    async fn window_change_request(
+        &mut self,
+        channel: ChannelId,
+        col_width: u32,
+        row_height: u32,
+        pix_width: u32,
+        pix_height: u32,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // attempt to resize PTY if we have a master fd
+        if let Some(fd) = self.pty_master_fd {
+            let ws = Winsize {
+                ws_row: row_height as u16,
+                ws_col: col_width as u16,
+                ws_xpixel: pix_width as u16,
+                ws_ypixel: pix_height as u16,
+            };
+            // SAFETY: TODO
+            unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws) };
+            self.pty_size = Some(ws);
+            session.channel_success(channel)?;
+        } else {
+            session.channel_failure(channel)?;
+            // TODO
+        }
+        Ok(())
+    }
+
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
         session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        let Some(user) = self
-            .username
-            .get()
-            .as_deref()
-            .and_then(|user| uzers::get_user_by_name(user))
-        else {
+        let Some(user) = self.username.get() else {
             return Ok(false);
         };
-        let home = user.home_dir();
+        let Some(user) = uzers::get_user_by_name(&*user) else {
+            return Ok(false);
+        };
+        let home = user.home_dir().to_owned();
 
-        let mut child = Command::new("/bin/sh")
-            .arg("-i")
-            .current_dir(&home)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        // allocate a PTY for interactive session using requested size if any
+        let pty = nix::pty::openpty(self.pty_size.as_ref(), None)?;
+        let master_fd = pty.master.as_raw_fd();
+        let slave_fd = pty.slave.as_raw_fd();
 
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
-        let stdin = child.stdin.take().unwrap();
+        // Store PTY to keep it alive throughout the session
+        *self._pty.lock().await = Some(pty);
 
-        self.stdin
-            .lock()
-            .await
-            .set(stdin)
-            .map_err(|_| anyhow::anyhow!("Already initialized TODO"))?;
+        // SAFETY: TODO
+        match unsafe { fork()? } {
+            ForkResult::Child => {
+                // Child: become session leader and set up slave PTY as controlling terminal
+                let _ = setsid();
 
-        forward(channel.id(), session.handle(), stdout);
-        forward(channel.id(), session.handle(), stderr);
+                // set controlling tty
+                // SAFETY: TODO
+                unsafe { libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) };
+
+                // Drop privileges: initgroups, setgid, setuid
+                let uname = CString::new(user.name().as_encoded_bytes()).unwrap();
+                let gid_raw = user.primary_group_id();
+                let uid_raw = user.uid();
+                // SAFETY: TODO
+                unsafe { libc::initgroups(uname.as_ptr(), gid_raw as libc::gid_t) };
+                let _ = setgid(Gid::from_raw(gid_raw));
+                let _ = setuid(Uid::from_raw(uid_raw));
+
+                // Redirect stdio to slave PTY
+                let _ = dup2(slave_fd, 0);
+                let _ = dup2(slave_fd, 1);
+                let _ = dup2(slave_fd, 2);
+
+                // Change to user's home directory
+                let _ = std::env::set_current_dir(&home);
+
+                // Exec shell (use user's shell)
+                let shell_path = user.shell().as_os_str().as_encoded_bytes();
+                let shell = CString::new(shell_path).unwrap();
+                let arg0 = CString::new(shell_path).unwrap();
+                let arg1 = CString::new("-i").unwrap();
+                let args = [arg0.as_c_str(), arg1.as_c_str()];
+                let _ = execv(shell.as_c_str(), &args);
+
+                std::process::exit(1);
+            }
+            ForkResult::Parent { child } => {
+                // Parent: close slave fd and forward IO on master fd
+                let _ = close(slave_fd);
+
+                // Duplicate master fd: one fd for reading/forwarding, one for writing
+                let read_fd = dup(master_fd)?;
+                let write_fd = dup(master_fd)?;
+
+                // SAFETY: TODO
+                let read = unsafe { std::fs::File::from_raw_fd(read_fd) };
+                // SAFETY: TODO
+                let write = unsafe { std::fs::File::from_raw_fd(write_fd) };
+
+                let read = fs::File::from_std(read);
+                let write = fs::File::from_std(write);
+
+                // Forward pty master output to SSH channel
+                forward(channel.id(), session.handle(), read);
+
+                // Store write as stdin writer (writes go to master)
+                *self.stdin.lock().await = Some(write);
+
+                // Store read_fd for window-change ioctls
+                self.pty_master_fd = Some(read_fd);
+
+                // Reap child in background to avoid zombies
+                tokio::task::spawn_blocking(move || {
+                    let _ = nix::sys::wait::waitpid(child, None);
+                });
+            }
+        }
 
         session.channel_success(channel.id())?;
         Ok(true)
@@ -143,7 +268,7 @@ impl Handler for Connection {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         let mut stdin = self.stdin.lock().await;
-        let Some(stdin) = stdin.get_mut() else {
+        let Some(stdin) = stdin.as_mut() else {
             return Ok(());
         };
         stdin.write_all(data).await?;
