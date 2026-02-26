@@ -1,18 +1,11 @@
-use std::net::IpAddr;
+use std::net::{ SocketAddr};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::OnceCell;
 
 struct Entry {
-    ip: IpAddr,
-    user: OnceCell<String>,
-    connected: bool,
-}
-
-impl Entry {
-    fn user(&self) -> Option<&str> {
-        self.user.get().map(String::as_str)
-    }
+    addr: Option<SocketAddr>,
+    user: String,
+    pswd: String,
 }
 
 #[derive(Clone, Default)]
@@ -26,58 +19,49 @@ impl Database {
         Default::default()
     }
 
-    pub fn connected(&self, ip: IpAddr) -> anyhow::Result<()> {
-        let mut lock = self.inner.lock().unwrap();
-        match lock.iter().position(|e| e.ip == ip) {
-            Some(pos) if lock[pos].connected => {
-                anyhow::bail!("Rejecting new connection from {ip}: already connected");
-            }
-            Some(pos) => {
-                lock[pos].connected = true;
-                Ok(())
-            }
-            None => {
-                lock.push(Entry {
-                    ip,
-                    user: OnceCell::new(),
-                    connected: true,
-                });
-                Ok(())
-            }
-        }
-    }
-
-    pub fn authorized(&self, ip: IpAddr, user: &str) -> anyhow::Result<()> {
+    pub fn authorized(&self, addr: SocketAddr, user: &str, password: &str) -> anyhow::Result<()> {
         let user = user.trim();
         if user == "root" {
             anyhow::bail!("root login is not allowed!")
         }
 
-        let lock = self.inner.lock().unwrap();
-        if let Some(pos) = lock.iter().position(|e| e.user() == Some(user)) {
-            anyhow::bail!(
-                "Rejecting new connection from {user}@{ip}: already logged-in from {}",
-                lock[pos].ip
-            );
-        };
-        let Some(pos) = lock.iter().position(|e| e.ip == ip) else {
-            anyhow::bail!("*should be impossible to see this*")
-        };
-        lock[pos].user.set(user.to_string()).map_err(Into::into)
-    }
-
-    pub fn disconnected(&self, ip: IpAddr) {
         let mut lock = self.inner.lock().unwrap();
-        let Some(pos) = lock.iter().position(|e| e.ip == ip) else {
-            unreachable!()
-        };
-        lock[pos].connected = false;
+        match lock.iter().position(|e| &e.user == user) {
+            None => {
+                lock.push(Entry {
+                    addr: Some(addr),
+                    user: user.to_string(),
+                    pswd: password.to_string(),
+                });
+            }
+            Some(pos) => {
+                if let Some(addr) = lock[pos].addr {
+                    anyhow::bail!(
+                        "Rejecting new connection from {user}: already logged-in from {addr}",
+                    );
+                }
+                if &lock[pos].pswd != password {
+                    anyhow::bail!(
+                        "Rejecting new connection from {user}: worng credentials",
+                    );
+                }
+                lock[pos].addr = Some(addr);
+            }
+        }
+        Ok(())
     }
 
-    pub fn user(&self, ip: IpAddr) -> Option<String> {
+    pub fn disconnected(&self, addr: SocketAddr) {
+        let mut lock = self.inner.lock().unwrap();
+        if let Some(pos) = lock.iter().position(|e| e.addr == Some(addr)) {
+            lock[pos].addr = None;
+        };
+    }
+
+    pub fn user(&self, addr: SocketAddr) -> Option<String> {
         let lock = self.inner.lock().unwrap();
         lock.iter()
-            .find_map(|e| (e.ip == ip).then(|| e.user()).flatten())
-            .map(|s| s.to_string())
+            .position(|e| e.addr == Some(addr))
+            .map(|pos| lock[pos].user.clone())
     }
 }

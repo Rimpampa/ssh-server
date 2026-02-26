@@ -6,7 +6,7 @@ use db::Database;
 use anyhow::Context;
 
 use std::ffi::CString;
-use std::net::IpAddr;
+use std::net::{ SocketAddr};
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,27 +65,18 @@ async fn main() -> anyhow::Result<()> {
     let db = Database::new();
     loop {
         let (stream, addr) = listener.accept().await?;
-        let ip = addr.ip();
-        info!("New connection from {ip}");
-
-        match db.connected(ip) {
-            Ok(()) => info!("Connection from {ip} registered"),
-            Err(e) => {
-                error!("Connection rejected from {ip}: {e}");
-                continue;
-            }
-        };
+        info!("New connection from {addr}");
 
         let config = config.clone();
         let db = db.clone();
         tokio::spawn(async move {
-            debug!("Starting SSH session handler for {ip}");
-            russh::server::run_stream(config, stream, Connection::new(db.clone(), ip))
+            debug!("Starting SSH session handler for {addr}");
+            russh::server::run_stream(config, stream, Connection::new(db.clone(), addr))
                 .await?
                 .await?;
-            info!("SSH session ended for {ip}");
-            db.disconnected(ip);
-            info!("Disconnected {ip}");
+            info!("SSH session ended for {addr}");
+            db.disconnected(addr);
+            info!("Disconnected {addr}");
             Result::<(), anyhow::Error>::Ok(())
         });
     }
@@ -94,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
 #[derive(Clone)]
 struct Connection {
     db: Database,
-    ip: IpAddr,
+    addr: SocketAddr,
     // child's stdin as an async file (parent writes to this to send data to child)
     stdin: Arc<Mutex<Option<tokio::fs::File>>>,
     // PTY negotiated size (cols, rows)
@@ -106,10 +97,10 @@ struct Connection {
 }
 
 impl Connection {
-    fn new(db: Database, ip: IpAddr) -> Self {
+    fn new(db: Database, addr: SocketAddr) -> Self {
         Self {
             db,
-            ip,
+            addr,
             stdin: Default::default(),
             pty_size: None,
             pty_term: None,
@@ -121,10 +112,14 @@ impl Connection {
 impl Handler for Connection {
     type Error = anyhow::Error;
 
-    async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
+    async fn auth_password(
+        &mut self,
+        user: &str,
+        password: &str,
+    ) -> Result<Auth, Self::Error> {
         info!("Authentication attempt for user: {user}");
 
-        if let Err(e) = self.db.authorized(self.ip, user) {
+        if let Err(e) = self.db.authorized(self.addr, user, password) {
             warn!("Authentication failed for user {user}: {e}");
             return Ok(Auth::reject());
         };
@@ -213,7 +208,7 @@ impl Handler for Connection {
         let channel_id = channel.id();
         info!("Channel open session request for channel {channel_id}");
 
-        let Some(user) = self.db.user(self.ip) else {
+        let Some(user) = self.db.user(self.addr) else {
             warn!("Channel open session failed: no username set for channel {channel_id}",);
             return Ok(false);
         };
