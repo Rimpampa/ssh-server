@@ -1,39 +1,31 @@
-# Stage 1: Builder
 FROM rust:latest AS builder
 
 WORKDIR /build
 
-# Install build dependencies for musl static linking
-RUN apt-get update && apt-get install -y \
-    pkg-config \
-    libssl-dev \
-    musl-tools \
-    && rm -rf /var/lib/apt/lists/*
+COPY Cargo.toml ./
+COPY src/  ./src/
 
-# Add musl target for static compilation
-RUN rustup target add x86_64-unknown-linux-musl
+RUN cargo build --release
 
-# Copy the project files
-COPY Cargo.toml Cargo.lock ./
-COPY src/ ./src/
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
-# Build the binary in release mode
-RUN cargo build --release --target x86_64-unknown-linux-musl
-
-# Stage 2: Runtime
-FROM alpine:latest
+FROM ubuntu:latest
 
 # Install runtime dependencies
-RUN apk add --no-cache \
+RUN apt-get update && apt-get install -y \
     openssl \
     xxd \
-    bash
+    bash \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set bash as default shell
+SHELL ["/bin/bash", "-lc"]
 
 # Create app directory
 WORKDIR /app
 
 # Copy the binary from builder stage (statically linked musl binary)
-COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/ssh-server /app/ssh-server
+COPY --from=builder /build/target/release/ssh-server /app/ssh-server
 
 # Set executable permissions
 RUN chmod +x /app/ssh-server

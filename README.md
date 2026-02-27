@@ -22,8 +22,8 @@ The `Dockerfile` uses a two-stage build process for optimization:
   - Full Rust toolchain
   - Compiles the project in release mode
   - ~2GB image size (discarded after build)
-- Stage 2: Runtime (`alpine:latest`)
-  - Minimal Alpine Linux base
+- Stage 2: Runtime (`ubuntu:latest`)
+  - Minimal Ubuntu Linux base
   - Runtime dependencies only:
     - `openssl` - Cryptographic operations
     - `xxd` - Hex dump utility
