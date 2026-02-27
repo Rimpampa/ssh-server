@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 struct Entry {
     addr: Option<SocketAddr>,
     user: String,
-    pswd: String,
 }
 
 #[derive(Clone, Default)]

@@ -8,7 +8,7 @@ use anyhow::Context;
 
 use std::ffi::{CString, OsStr};
 use std::net::SocketAddr;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStringExt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +25,16 @@ use uzers::os::unix::UserExt;
 use nix::unistd::{Gid, Uid, setgid, setuid};
 
 use log::{debug, error, info, warn};
+
+/// Helper macro to create a [`CString`] from multiple parts that may be [`OsStr`]
+macro_rules! cstring {
+    ($f:expr $(, $e:expr)* $(,)?) => {{
+        #[allow(unused_mut)]
+        let mut string = OsStr::new($f).to_os_string();
+        $(string.push($e);)*
+        CString::new(string.into_vec())
+    }}
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -124,6 +134,24 @@ impl Handler for Connection {
                 anyhow::bail!("useradd failed");
             }
             info!("User {user} created successfully");
+
+            let mut child = Command::new("chpasswd")
+                .stdin(std::process::Stdio::piped())
+                .spawn()?;
+
+            let Some(stdin) = child.stdin.as_mut() else {
+                anyhow::bail!("Missing stdin for chpasswd child process");
+            };
+            stdin.write_all(user.as_bytes()).await?;
+            stdin.write_all(":".as_bytes()).await?;
+            stdin.write_all(password.as_bytes()).await?;
+            stdin.write_all("\n".as_bytes()).await?;
+
+            let status = child.wait().await?;
+            if !status.success() {
+                error!("chpasswd failed for user {user}");
+                anyhow::bail!("chpasswd failed");
+            }
         } else {
             info!("User {user} already exists");
         }
@@ -213,10 +241,13 @@ impl Handler for Connection {
         // NOTE:
         //   Prepare the array of C strings before forking to avoid memory allocation in the
         //   child process, which may not be async-signal-safe (check following SAFETY notice)
-        let shell = CString::new(user.shell().as_os_str().as_bytes()).unwrap();
+        let shell = cstring!(user.shell()).unwrap();
         let shell = shell.as_ptr();
-        let arg = CString::new("-i").unwrap();
-        let args = [shell, arg.as_ptr(), std::ptr::null()];
+        let Some(sh_file) = user.shell().file_name() else {
+            anyhow::bail!("User shell path is not a file ({:?})", user.shell())
+        };
+        let sh_file = cstring!(sh_file).unwrap();
+        let args = [shell, sh_file.as_ptr(), std::ptr::null()];
 
         // allocate a PTY for interactive session using requested size if any
         // SAFETY:
@@ -311,15 +342,6 @@ fn forward<R: AsyncRead + Unpin + Send + 'static>(id: ChannelId, handle: Handle,
         }
         info!("Output forwarder ended for channel {}", id);
     });
-}
-
-/// Helper macro to create a [`CString`] from multiple parts that may be [`OsStr`]
-macro_rules! cstring {
-    ($f:expr $(, $e:expr)* $(,)?) => {{
-        let mut string = OsStr::new($f).to_os_string();
-        $(string.push($e);)*
-        CString::new(string.into_vec())
-    }}
 }
 
 /// Create a copy of the current environment variables
