@@ -1,6 +1,5 @@
-use std::net::{ SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-
 
 struct Entry {
     addr: Option<SocketAddr>,
@@ -41,9 +40,7 @@ impl Database {
                     );
                 }
                 if &lock[pos].pswd != password {
-                    anyhow::bail!(
-                        "Rejecting new connection from {user}: worng credentials",
-                    );
+                    anyhow::bail!("Rejecting new connection from {user}: worng credentials",);
                 }
                 lock[pos].addr = Some(addr);
             }

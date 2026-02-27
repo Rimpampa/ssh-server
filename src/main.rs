@@ -1,13 +1,14 @@
-// mod pty;
-
 mod db;
 use db::Database;
 
+mod pty;
+use pty::{Pty, PtyFork};
+
 use anyhow::Context;
 
-use std::ffi::CString;
-use std::net::{ SocketAddr};
-use std::os::fd::{AsRawFd, IntoRawFd};
+use std::ffi::{CString, OsStr};
+use std::net::SocketAddr;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,10 +23,7 @@ use tokio::sync::Mutex;
 
 use uzers::os::unix::UserExt;
 
-use libc;
-
-use nix::pty::{OpenptyResult, Winsize};
-use nix::unistd::{ForkResult, Gid, Uid, dup2, execv, fork, setgid, setsid, setuid};
+use nix::unistd::{Gid, Uid, setgid, setuid};
 
 use log::{debug, error, info, warn};
 
@@ -59,6 +57,10 @@ async fn main() -> anyhow::Result<()> {
         ..Default::default()
     });
 
+    // Initialize the environment variables once and share them with all connections to avoid
+    // repeated allocations while handling SSH sessions.
+    let env = env();
+
     let listener = TcpListener::bind("0.0.0.0:2222").await?;
     info!("SSH Server listening on 0.0.0.0:2222");
 
@@ -69,9 +71,10 @@ async fn main() -> anyhow::Result<()> {
 
         let config = config.clone();
         let db = db.clone();
+        let env = env.clone();
         tokio::spawn(async move {
             debug!("Starting SSH session handler for {addr}");
-            russh::server::run_stream(config, stream, Connection::new(db.clone(), addr))
+            russh::server::run_stream(config, stream, Connection::new(db.clone(), addr, env))
                 .await?
                 .await?;
             info!("SSH session ended for {addr}");
@@ -86,25 +89,20 @@ async fn main() -> anyhow::Result<()> {
 struct Connection {
     db: Database,
     addr: SocketAddr,
-    // child's stdin as an async file (parent writes to this to send data to child)
+    /// Child's stdin as an async file
     stdin: Arc<Mutex<Option<tokio::fs::File>>>,
-    // PTY negotiated size (cols, rows)
-    pty_size: Option<Winsize>,
-    // terminal name (TERM)
-    pty_term: Option<String>,
-    // raw master fd for ioctl window changes (use duplicated fd)
-    pty_master_fd: Option<i32>,
+    pty: Pty,
+    env: Arc<Vec<CString>>,
 }
 
 impl Connection {
-    fn new(db: Database, addr: SocketAddr) -> Self {
+    fn new(db: Database, addr: SocketAddr, env: Arc<Vec<CString>>) -> Self {
         Self {
             db,
             addr,
             stdin: Default::default(),
-            pty_size: None,
-            pty_term: None,
-            pty_master_fd: None,
+            pty: Default::default(),
+            env,
         }
     }
 }
@@ -112,11 +110,7 @@ impl Connection {
 impl Handler for Connection {
     type Error = anyhow::Error;
 
-    async fn auth_password(
-        &mut self,
-        user: &str,
-        password: &str,
-    ) -> Result<Auth, Self::Error> {
+    async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
         info!("Authentication attempt for user: {user}");
 
         if let Err(e) = self.db.authorized(self.addr, user, password) {
@@ -144,58 +138,35 @@ impl Handler for Connection {
         &mut self,
         channel: ChannelId,
         term: &str,
-        col_width: u32,
-        row_height: u32,
-        pix_width: u32,
-        pix_height: u32,
+        col_w: u32,
+        row_h: u32,
+        pix_w: u32,
+        pix_h: u32,
         _modes: &[(russh::Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        info!(
-            "PTY request for channel {channel}: term={term}, cols={col_width}, rows={row_height}",
-        );
-
-        self.pty_size = Some(Winsize {
-            ws_row: row_height as u16,
-            ws_col: col_width as u16,
-            ws_xpixel: pix_width as u16,
-            ws_ypixel: pix_height as u16,
-        });
-        self.pty_term = Some(term.to_string());
+        info!("PTY request for channel {channel}: term={term}, cols={col_w}, rows={row_h}",);
+        self.pty.request(col_w, row_h, pix_w, pix_h, term);
         session.channel_success(channel)?;
-
-        info!("PTY allocated successfully for channel {channel}");
         Ok(())
     }
 
     async fn window_change_request(
         &mut self,
         channel: ChannelId,
-        col_width: u32,
-        row_height: u32,
-        pix_width: u32,
-        pix_height: u32,
+        col_w: u32,
+        row_h: u32,
+        pix_w: u32,
+        pix_h: u32,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        info!("Window change request for channel {channel}: cols={col_width}, rows={row_height}",);
-
-        // attempt to resize PTY if we have a master fd
-        if let Some(fd) = self.pty_master_fd {
-            let ws = Winsize {
-                ws_row: row_height as u16,
-                ws_col: col_width as u16,
-                ws_xpixel: pix_width as u16,
-                ws_ypixel: pix_height as u16,
-            };
-            // SAFETY: TODO
-            unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws) };
-            self.pty_size = Some(ws);
-            session.channel_success(channel)?;
-            debug!("Window resized for channel {channel}");
-        } else {
-            warn!("Window change requested but no master fd available for channel {channel}",);
-            session.channel_failure(channel)?;
-            // TODO
+        info!("Window change request for channel {channel}: cols={col_w}, rows={row_h}",);
+        match self.pty.window_change(col_w, row_h, pix_w, pix_h) {
+            Ok(()) => session.channel_success(channel)?,
+            Err(()) => {
+                warn!("Window change requested but no master fd available for channel {channel}",);
+                session.channel_failure(channel)?;
+            }
         }
         Ok(())
     }
@@ -218,93 +189,78 @@ impl Handler for Connection {
         };
         let home = user.home_dir().to_owned();
 
+        let child_env = child_env(&user, self.pty.term.as_deref());
+        // From man execve(2):
+        // > envp is an array of pointers to strings, conventionally of the
+        // > form key=value, which are passed as the environment of the new
+        // > program.  The envp array must be terminated by a null pointer.
+        // NOTE:
+        //   Prepare the array of C strings before forking to avoid memory allocation in the
+        //   child process, which may not be async-signal-safe (check following SAFETY notice)
+        let env: Box<[*const i8]> = self
+            .env
+            .iter()
+            .chain(&child_env)
+            .map(|s| s.as_ptr())
+            .chain([std::ptr::null()])
+            .collect();
+
+        // From execve(2):
+        // > argv is an array of pointers to strings passed to the new program
+        // > as its command-line arguments.  By convention, the first of these
+        // > strings (i.e., argv[0]) should contain the filename associated
+        // > with the file being executed.  The argv array must be terminated
+        // > by a null pointer.  (Thus, in the new program, argv[argc] will be
+        // > a null pointer.)
+        // NOTE:
+        //   Prepare the array of C strings before forking to avoid memory allocation in the
+        //   child process, which may not be async-signal-safe (check following SAFETY notice)
+        let shell = CString::new(user.shell().as_os_str().as_bytes()).unwrap();
+        let shell = shell.as_ptr();
+        let arg = CString::new("-i").unwrap();
+        let args = [shell, arg.as_ptr(), std::ptr::null()];
+
         // allocate a PTY for interactive session using requested size if any
-        let OpenptyResult { master, slave } = nix::pty::openpty(self.pty_size.as_ref(), None)?;
-        debug!("PTY allocated: master={master:?}, slave={slave:?}");
+        // SAFETY:
+        // From the nix crate (https://docs.rs/nix/latest/nix/unistd/fn.fork.html#safety)
+        // > In a multithreaded program, only async-signal-safe functions like pause and _exit may
+        // > be called by the child (the parent isn’t restricted) until a call of execve(2). Note
+        // > that memory allocation may not be async-signal-safe and thus must be prevented.
+        match unsafe { self.pty.open()? } {
+            PtyFork::Child => {
+                // NOTE: (reference: man signal-safety(7))
+                //   All those function (setgid, setuid, chdir) are async-signal-safe according to POSIX,
+                //   so it's safe to call them in the child process after fork without execve
+                let _ = setgid(Gid::from_raw(user.primary_group_id()));
+                let _ = setuid(Uid::from_raw(user.uid()));
+                let _ = std::env::set_current_dir(&home); // <-- Calls chdir
 
-        // SAFETY: TODO
-        match unsafe { fork()? } {
-            ForkResult::Child => {
-                let slave = slave.into_raw_fd();
-                debug!("CHILD - Child process started");
-                // Child: become session leader and set up slave PTY as controlling terminal
-                let _ = setsid();
+                // NOTE: Cannot use nix::unistd::execve since it allocates (not async-signal-safe)
+                // SAFETY: all the arguments are constructed coorectly (check above)
+                let res = unsafe { libc::execve(shell, args.as_ptr(), env.as_ptr()) };
+                let _ = nix::errno::Errno::result(res); // <-- Usually done by nix crate
 
-                // set controlling tty
-                // SAFETY: TODO
-                unsafe { libc::ioctl(slave, libc::TIOCSCTTY, 0) };
-                debug!("CHILD - Set controlling tty");
-
-                // Drop privileges: initgroups, setgid, setuid
-                let uname = CString::new(user.name().as_encoded_bytes()).unwrap();
-                let gid_raw = user.primary_group_id();
-                let uid_raw = user.uid();
-                info!(
-                    "CHILD - Setting privileges for user: {:?} (uid={uid_raw}, gid={gid_raw})",
-                    user.name(),
-                );
-                // SAFETY: TODO
-                unsafe { libc::initgroups(uname.as_ptr(), gid_raw as libc::gid_t) };
-                let _ = setgid(Gid::from_raw(gid_raw));
-                let _ = setuid(Uid::from_raw(uid_raw));
-
-                // Redirect stdio to slave PTY
-                let _ = dup2(slave, 0);
-                let _ = dup2(slave, 1);
-                let _ = dup2(slave, 2);
-
-                // SAFETY: TODO
-                unsafe {
-                    // Setup environment variables for the child process
-                    std::env::remove_var("SSH_ASKPASS");
-                    std::env::set_var("HOME", &home);
-                    std::env::set_var("USER", user.name());
-                    std::env::set_var("LOGNAME", user.name());
-                    std::env::set_var("SHELL", user.shell());
-
-                    // Set TERM if provided in PTY request
-                    if let Some(ref term) = self.pty_term {
-                        std::env::set_var("TERM", term);
-                    }
-                }
-
-                // Change to user's home directory
-                let _ = std::env::set_current_dir(&home);
-                debug!("CHILD - Changed working directory to {}", home.display());
-
-                // Exec shell (use user's shell)
-                let shell_path = user.shell().as_os_str().as_encoded_bytes();
-                let shell = CString::new(shell_path).unwrap();
-                let arg0 = CString::new(shell_path).unwrap();
-                let arg1 = CString::new("-i").unwrap();
-                let args = [arg0.as_c_str(), arg1.as_c_str()];
-                let _ = execv(shell.as_c_str(), &args);
-
-                error!("CHILD - execv failed, exiting child");
                 std::process::exit(1);
             }
-            ForkResult::Parent { child } => {
-                info!("PRENT - Child process spawned with pid={child}",);
+            PtyFork::Parent { fd: master, child } => {
+                // NOTE:
+                // env must be dropped before the first await point
+                // since it holds raw pointers which are not Send
+                drop(env);
 
                 let master = std::fs::File::from(master);
                 let write = tokio::fs::File::from_std(master);
                 let read = write.try_clone().await?;
-                let read_fd = read.as_raw_fd();
 
-                // Forward pty master output to SSH channel
                 info!("PRENT - Starting output forwarder for channel {channel_id}",);
                 forward(channel.id(), session.handle(), read);
 
-                // Store write as stdin writer (writes go to master)
                 *self.stdin.lock().await = Some(write);
 
-                // Store read_fd for window-change ioctls
-                self.pty_master_fd = Some(read_fd);
-
-                // Reap child in background to avoid zombies
                 tokio::task::spawn_blocking(move || {
                     let _ = nix::sys::wait::waitpid(child, None);
                     info!("PRENT - Child process {child} reaped");
+                    // TODO: close session
                 });
             }
         }
@@ -339,6 +295,8 @@ impl Handler for Connection {
     }
 }
 
+/// Forward the data coming from the given reader to the SSH session channel until EOF or an error occurs,
+/// in which case the channel is closed.
 fn forward<R: AsyncRead + Unpin + Send + 'static>(id: ChannelId, handle: Handle, reader: R) {
     tokio::spawn(async move {
         debug!("Output forwarder started for channel {id}");
@@ -356,4 +314,40 @@ fn forward<R: AsyncRead + Unpin + Send + 'static>(id: ChannelId, handle: Handle,
         }
         info!("Output forwarder ended for channel {}", id);
     });
+}
+
+/// Helper macro to create a [`CString`] from multiple parts that may be [`OsStr`]
+macro_rules! cstring {
+    ($f:expr $(, $e:expr)* $(,)?) => {{
+        let mut string = OsStr::new($f).to_os_string();
+        $(string.push($e);)*
+        CString::new(string.into_vec())
+    }}
+}
+
+/// Create a copy of the current environment variables
+fn env() -> Arc<Vec<CString>> {
+    Arc::new(
+        std::env::vars_os()
+            .filter_map(|(k, v)| cstring!(&k, "=", v).ok())
+            .collect(),
+    )
+}
+
+/// Build the basic environment variables for the child process based on the authenticated user and requested terminal type.
+///
+/// The returned environment variables are:
+/// - `TERM`: set to the requested terminal type or default to `xterm-256
+/// - `HOME`: set to the user's home directory
+/// - `USER`: set to the user's name
+/// - `LOGNAME`: set to the user's name
+/// - `SHELL`: set to the user's shell
+fn child_env(user: &uzers::User, term: Option<&str>) -> Vec<CString> {
+    vec![
+        cstring!("TERM=", term.unwrap_or("xterm-256color")).unwrap(),
+        cstring!("HOME=", user.home_dir()).unwrap(),
+        cstring!("USER=", user.name()).unwrap(),
+        cstring!("LOGNAME=", user.name()).unwrap(),
+        cstring!("SHELL=", user.shell()).unwrap(),
+    ]
 }
