@@ -85,12 +85,11 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-#[derive(Clone)]
 struct Connection {
     db: Database,
     addr: SocketAddr,
     /// Child's stdin as an async file
-    stdin: Arc<Mutex<Option<tokio::fs::File>>>,
+    stdin: Option<tokio::fs::File>,
     pty: Pty,
     env: Arc<Vec<CString>>,
 }
@@ -255,7 +254,7 @@ impl Handler for Connection {
                 info!("PRENT - Starting output forwarder for channel {channel_id}",);
                 forward(channel.id(), session.handle(), read);
 
-                *self.stdin.lock().await = Some(write);
+                self.stdin = Some(write);
 
                 tokio::task::spawn_blocking(move || {
                     let _ = nix::sys::wait::waitpid(child, None);
@@ -284,8 +283,7 @@ impl Handler for Connection {
             return Err(russh::Error::Disconnect.into());
         }
 
-        let mut stdin = self.stdin.lock().await;
-        let Some(stdin) = stdin.as_mut() else {
+        let Some(stdin) = self.stdin.as_mut() else {
             warn!("Data received but no stdin available for channel {channel}",);
             return Ok(());
         };
