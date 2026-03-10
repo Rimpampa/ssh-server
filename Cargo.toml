@@ -3,6 +3,16 @@ name = "ssh-server"
 version = "0.1.0"
 edition = "2024"
 
+[dependencies]
+sha2 = "0.10.9"
+libc = "0.2"
+anyhow = "1.0"
+async-trait = "0.1"
+uzers = "0.12"
+log = "0.4"
+env_logger = "0.11"
+base64 = "0.22.1"
+
 [dependencies.russh]
 version = "0.57"
 default-features = false
@@ -12,24 +22,6 @@ features = ["ring"]
 version = "1.49"
 features = ["full"]
 
-[dependencies.libc]
-version = "0.2"
-
-[dependencies.anyhow]
-version = "1.0"
-
-[dependencies.async-trait]
-version = "0.1"
-
-[dependencies.uzers]
-version = "0.12"
-
 [dependencies.nix]
 version = "0.27"
 features = ["term", "process", "fs", "user"]
-
-[dependencies.log]
-version = "0.4"
-
-[dependencies.env_logger]
-version = "0.11"

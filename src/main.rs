@@ -18,7 +18,6 @@ use russh::{Channel, ChannelId, CryptoVec};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::process::Command;
 
 use uzers::os::unix::UserExt;
 
@@ -121,40 +120,10 @@ impl Handler for Connection {
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
         info!("Authentication attempt for user: {user}");
 
-        if let Err(e) = self.db.authorized(self.addr, user, password) {
+        if let Err(e) = self.db.authorize(self.addr, user, password).await {
             warn!("Authentication failed for user {user}: {e}");
             return Ok(Auth::reject());
         };
-
-        if let None = uzers::get_user_by_name(user) {
-            info!("User {user} does not exist, creating...");
-            let status = Command::new("useradd").arg("-m").arg(user).status().await?;
-            if !status.success() {
-                error!("useradd failed for user {user}");
-                anyhow::bail!("useradd failed");
-            }
-            info!("User {user} created successfully");
-
-            let mut child = Command::new("chpasswd")
-                .stdin(std::process::Stdio::piped())
-                .spawn()?;
-
-            let Some(stdin) = child.stdin.as_mut() else {
-                anyhow::bail!("Missing stdin for chpasswd child process");
-            };
-            stdin.write_all(user.as_bytes()).await?;
-            stdin.write_all(":".as_bytes()).await?;
-            stdin.write_all(password.as_bytes()).await?;
-            stdin.write_all("\n".as_bytes()).await?;
-
-            let status = child.wait().await?;
-            if !status.success() {
-                error!("chpasswd failed for user {user}");
-                anyhow::bail!("chpasswd failed");
-            }
-        } else {
-            info!("User {user} already exists");
-        }
 
         info!("Authentication accepted for user {user}");
         Ok(Auth::Accept)
@@ -207,10 +176,6 @@ impl Handler for Connection {
 
         let Some(user) = self.db.user(self.addr) else {
             warn!("Channel open session failed: no username set for channel {channel_id}",);
-            return Ok(false);
-        };
-        let Some(user) = uzers::get_user_by_name(&*user) else {
-            warn!("Channel open session failed: user not found for channel {channel_id}",);
             return Ok(false);
         };
         let home = user.home_dir().to_owned();

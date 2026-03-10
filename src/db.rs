@@ -1,9 +1,15 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use tokio::process::Command;
+
+use sha2::{Digest, Sha256};
+
+use base64::prelude::*;
+
 struct Entry {
     addr: Option<SocketAddr>,
-    user: String,
+    user: uzers::User,
 }
 
 #[derive(Clone, Default)]
@@ -17,31 +23,78 @@ impl Database {
         Default::default()
     }
 
-    pub fn authorized(&self, addr: SocketAddr, user: &str, password: &str) -> anyhow::Result<()> {
+    /// Hashes the password as it would be done by the `crypt` command
+    fn crypt(password: &str) -> String {
+        //        ┌ 5 is the code for SHA256
+        //        ↓  ↙ no salt is used (simplifies verification)
+        format!("$5$${}", BASE64_STANDARD.encode(Sha256::digest(password)))
+    }
+
+    /// Create a new user in the OS and set its password in /etc/shadow
+    async fn create(user: &str, password: &str) -> anyhow::Result<uzers::User> {
+        if !Command::new("useradd")
+            .arg("-m")
+            .arg(user)
+            .status()
+            .await?
+            .success()
+        {
+            anyhow::bail!("useradd failed")
+        };
+
+        let password = format!("{user}:{}", Self::crypt(password));
+
+        let shadow = tokio::fs::read_to_string("/etc/shadow").await?;
+        let shadow = shadow.replace(&format!("{user}:!:"), &password);
+        tokio::fs::write("/etc/shadow", shadow).await?;
+
+        match uzers::get_user_by_name(user) {
+            Some(user) => Ok(user),
+            None => anyhow::bail!("* impossible *"),
+        }
+    }
+
+    /// Verify that the given existing user as the provided password in /etc/shadow
+    async fn verify(user: uzers::User, password: &str) -> anyhow::Result<uzers::User> {
+        let password = format!("{}:{}:", user.name().display(), Self::crypt(password));
+        let shadow = tokio::fs::read_to_string("/etc/shadow").await?;
+        anyhow::ensure!(
+            shadow.lines().any(|line| line.starts_with(&password)),
+            "Wrong password!"
+        );
+        Ok(user)
+    }
+
+    pub async fn authorize(
+        &self,
+        addr: SocketAddr,
+        user: &str,
+        password: &str,
+    ) -> anyhow::Result<()> {
         let user = user.trim();
         if user == "root" {
             anyhow::bail!("root login is not allowed!")
         }
 
+        let user = match uzers::get_user_by_name(user) {
+            None => Self::create(user, password).await?,
+            Some(user) => Self::verify(user, password).await?,
+        };
+
         let mut lock = self.inner.lock().unwrap();
-        match lock.iter().position(|e| &e.user == user) {
-            None => {
-                lock.push(Entry {
-                    addr: Some(addr),
-                    user: user.to_string(),
-                    pswd: password.to_string(),
-                });
-            }
-            Some(pos) => {
-                if let Some(addr) = lock[pos].addr {
+        match lock.iter_mut().find(|e| e.user.name() == user.name()) {
+            None => lock.push(Entry {
+                addr: Some(addr),
+                user,
+            }),
+            Some(entry) => {
+                if let Some(addr) = entry.addr {
                     anyhow::bail!(
-                        "Rejecting new connection from {user}: already logged-in from {addr}",
+                        "Rejecting new connection from '{}': already logged-in from {addr}",
+                        user.name().display()
                     );
                 }
-                if &lock[pos].pswd != password {
-                    anyhow::bail!("Rejecting new connection from {user}: worng credentials",);
-                }
-                lock[pos].addr = Some(addr);
+                entry.addr = Some(addr)
             }
         }
         Ok(())
@@ -54,7 +107,7 @@ impl Database {
         };
     }
 
-    pub fn user(&self, addr: SocketAddr) -> Option<String> {
+    pub fn user(&self, addr: SocketAddr) -> Option<uzers::User> {
         let lock = self.inner.lock().unwrap();
         lock.iter()
             .position(|e| e.addr == Some(addr))
