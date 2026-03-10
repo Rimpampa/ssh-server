@@ -247,7 +247,7 @@ impl Handler for Connection {
             anyhow::bail!("User shell path is not a file ({:?})", user.shell())
         };
         let sh_file = cstring!(sh_file).unwrap();
-        let args = [shell, sh_file.as_ptr(), std::ptr::null()];
+        let sh_param = cstring!("-i").unwrap();
 
         // allocate a PTY for interactive session using requested size if any
         // SAFETY:
@@ -266,6 +266,7 @@ impl Handler for Connection {
 
                 // NOTE: Cannot use nix::unistd::execve since it allocates (not async-signal-safe)
                 // SAFETY: all the arguments are constructed coorectly (check above)
+                let args = [sh_file.as_ptr(), sh_param.as_ptr(), std::ptr::null()];
                 let res = unsafe { libc::execve(shell, args.as_ptr(), env.as_ptr()) };
                 let _ = nix::errno::Errno::result(res); // <-- Usually done by nix crate
 
