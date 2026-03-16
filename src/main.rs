@@ -82,9 +82,11 @@ async fn main() -> anyhow::Result<()> {
         let env = env.clone();
         tokio::spawn(async move {
             debug!("Starting SSH session handler for {addr}");
-            russh::server::run_stream(config, stream, Connection::new(db.clone(), addr, env))
-                .await?
-                .await?;
+            let conn = Connection::new(db.clone(), addr, env);
+            let session = russh::server::run_stream(config, stream, conn).await?;
+            if let Err(e) = session.await {
+                debug!("SSH session ended with error {e:?}");
+            }
             info!("SSH session ended for {addr}");
             db.disconnected(addr);
             info!("Disconnected {addr}");
@@ -118,14 +120,14 @@ impl Handler for Connection {
     type Error = anyhow::Error;
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
-        info!("Authentication attempt for user: {user}");
+        info!("Authentication attempt for '{user}'");
 
         if let Err(e) = self.db.authorize(self.addr, user, password).await {
-            warn!("Authentication failed for user {user}: {e}");
+            warn!("Authentication failed for '{user}': {e}");
             return Ok(Auth::reject());
         };
 
-        info!("Authentication accepted for user {user}");
+        info!("Authentication accepted for '{user}'");
         Ok(Auth::Accept)
     }
 
@@ -172,13 +174,12 @@ impl Handler for Connection {
         session: &mut Session,
     ) -> Result<bool, Self::Error> {
         let channel_id = channel.id();
-        info!("Channel open session request for channel {channel_id}");
-
         let Some(user) = self.db.user(self.addr) else {
             warn!("Channel open session failed: no username set for channel {channel_id}",);
             return Ok(false);
         };
-        let home = user.home_dir().to_owned();
+        let name = user.name();
+        info!("{name:?} - Channel {channel_id} open session request");
 
         let child_env = child_env(&user, self.pty.term.as_deref());
         // From man execve(2):
@@ -206,13 +207,14 @@ impl Handler for Connection {
         // NOTE:
         //   Prepare the array of C strings before forking to avoid memory allocation in the
         //   child process, which may not be async-signal-safe (check following SAFETY notice)
-        let shell = cstring!(user.shell()).unwrap();
-        let shell = shell.as_ptr();
-        let Some(sh_file) = user.shell().file_name() else {
-            anyhow::bail!("User shell path is not a file ({:?})", user.shell())
+        let shell = user.shell();
+        let exe = cstring!(shell).unwrap();
+        let exe = exe.as_ptr();
+        let Some(exe_file) = shell.file_name() else {
+            anyhow::bail!("{name:?} - Shell path is not a file: {shell:?}")
         };
-        let sh_file = cstring!(sh_file).unwrap();
-        let sh_param = cstring!("-i").unwrap();
+        let exe_file = cstring!(exe_file).unwrap();
+        let exe_param = cstring!("-i").unwrap();
 
         // allocate a PTY for interactive session using requested size if any
         // SAFETY:
@@ -227,12 +229,12 @@ impl Handler for Connection {
                 //   so it's safe to call them in the child process after fork without execve
                 let _ = setgid(Gid::from_raw(user.primary_group_id()));
                 let _ = setuid(Uid::from_raw(user.uid()));
-                let _ = std::env::set_current_dir(&home); // <-- Calls chdir
+                let _ = std::env::set_current_dir(user.home_dir()); // <-- Calls chdir
 
                 // NOTE: Cannot use nix::unistd::execve since it allocates (not async-signal-safe)
                 // SAFETY: all the arguments are constructed coorectly (check above)
-                let args = [sh_file.as_ptr(), sh_param.as_ptr(), std::ptr::null()];
-                let res = unsafe { libc::execve(shell, args.as_ptr(), env.as_ptr()) };
+                let args = [exe_file.as_ptr(), exe_param.as_ptr(), std::ptr::null()];
+                let res = unsafe { libc::execve(exe, args.as_ptr(), env.as_ptr()) };
                 let _ = nix::errno::Errno::result(res); // <-- Usually done by nix crate
 
                 std::process::exit(1);
@@ -247,21 +249,21 @@ impl Handler for Connection {
                 let write = tokio::fs::File::from_std(master);
                 let read = write.try_clone().await?;
 
-                info!("PRENT - Starting output forwarder for channel {channel_id}",);
-                forward(channel.id(), session.handle(), read);
+                info!("{name:?} - Forward output from PID {child} to channel {channel_id}",);
+                forward(channel_id, session.handle(), read);
 
                 self.stdin = Some(write);
 
+                let name = name.to_os_string();
                 tokio::task::spawn_blocking(move || {
                     let _ = nix::sys::wait::waitpid(child, None);
-                    info!("PRENT - Child process {child} reaped");
-                    // TODO: close session
+                    info!("{name:?} - Shell process {child} ended");
                 });
             }
         }
 
-        session.channel_success(channel.id())?;
-        info!("PRENT - Channel {channel_id} session opened successfully");
+        session.channel_success(channel_id)?;
+        info!("{name:?} - Channel {channel_id} session opened successfully");
         Ok(true)
     }
 
