@@ -271,16 +271,8 @@ impl Handler for Connection {
         &mut self,
         channel: russh::ChannelId,
         data: &[u8],
-        session: &mut Session,
+        _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // Close channel when exit is received
-        let cmd = std::str::from_utf8(data).map(str::trim);
-        if cmd == Ok("exit") {
-            info!("Exit command received on channel {channel}");
-            session.disconnect(russh::Disconnect::ByApplication, "User requested exit", "")?;
-            return Err(russh::Error::Disconnect.into());
-        }
-
         let Some(stdin) = self.stdin.as_mut() else {
             warn!("Data received but no stdin available for channel {channel}",);
             return Ok(());
@@ -308,7 +300,13 @@ fn forward<R: AsyncRead + Unpin + Send + 'static>(id: ChannelId, handle: Handle,
                 Ok(n) => handle.data(id, CryptoVec::from(&buf[..n])).await,
             };
         }
-        info!("Output forwarder ended for channel {}", id);
+        info!("Child process ended, closing channel {id} and disconnecting...");
+        let _ = handle.close(id);
+        let _ = handle.disconnect(
+            russh::Disconnect::ByApplication,
+            "User requested exit".into(),
+            "".into(),
+        );
     });
 }
 
