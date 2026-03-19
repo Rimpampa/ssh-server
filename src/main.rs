@@ -4,6 +4,8 @@ use db::Database;
 mod pty;
 use pty::{Pty, PtyFork};
 
+mod crypt;
+
 use anyhow::Context;
 
 use std::ffi::{CString, OsStr};

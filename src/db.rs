@@ -1,11 +1,12 @@
+use std::ffi::CString;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use tokio::process::Command;
 
-use sha2::{Digest, Sha256};
+use anyhow::Context;
 
-use base64::prelude::*;
+use crate::crypt;
 
 struct Entry {
     addr: Option<SocketAddr>,
@@ -23,13 +24,6 @@ impl Database {
         Default::default()
     }
 
-    /// Hashes the password as it would be done by the `crypt` command
-    fn crypt(password: &str) -> String {
-        //        ┌ 5 is the code for SHA256
-        //        ↓  ↙ no salt is used (simplifies verification)
-        format!("$5$${}", BASE64_STANDARD.encode(Sha256::digest(password)))
-    }
-
     /// Create a new user in the OS and set its password in /etc/shadow
     async fn create(user: &str, password: &str) -> anyhow::Result<uzers::User> {
         if !Command::new("useradd")
@@ -42,7 +36,11 @@ impl Database {
             anyhow::bail!("useradd failed")
         };
 
-        let password = format!("{user}:{}", Self::crypt(password));
+        let salt = crypt::gensalt(None, 0, None).with_context(|| "Salt generation failed")?;
+        let password = CString::new(password)?;
+        let password = crypt::crypt(&password, &salt).with_context(|| "Password hashing failed")?;
+        let password = password.into_string().with_context(|| "Password conversion failed")?;
+        let password = format!("{user}:{password}:");
 
         let shadow = tokio::fs::read_to_string("/etc/shadow").await?;
         let shadow = shadow.replace(&format!("{user}:!:"), &password);
@@ -56,12 +54,13 @@ impl Database {
 
     /// Verify that the given existing user as the provided password in /etc/shadow
     async fn verify(user: uzers::User, password: &str) -> anyhow::Result<uzers::User> {
-        let password = format!("{}:{}:", user.name().display(), Self::crypt(password));
+        let pat = format!("{}:", user.name().to_str().unwrap());
         let shadow = tokio::fs::read_to_string("/etc/shadow").await?;
-        anyhow::ensure!(
-            shadow.lines().any(|line| line.starts_with(&password)),
-            "Wrong password!"
-        );
+        let line = shadow.lines().find(|l| l.starts_with(&pat)).with_context(|| "User not in /etc/shadow")?;
+        let enc = line.split(':').nth(1).with_context(|| "Malformed /etc/shadow")?;
+        let enc = CString::new(enc)?;
+        let password = CString::new(password)?;
+        anyhow::ensure!(crypt::verify(&password, &enc), "Wrong password");
         Ok(user)
     }
 
