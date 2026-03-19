@@ -4,12 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-libc = "0.2"
 anyhow = "1.0"
 async-trait = "0.1"
 uzers = "0.12"
 log = "0.4"
 env_logger = "0.11"
+
+[dependencies.pty-process]
+version = "0.5.3"
+features = ["async"]
 
 [dependencies.russh]
 version = "0.57"
@@ -19,10 +22,6 @@ features = ["ring"]
 [dependencies.tokio]
 version = "1.49"
 features = ["full"]
-
-[dependencies.nix]
-version = "0.27"
-features = ["term", "process", "fs", "user"]
 
 [build-dependencies]
 bindgen = "0.71.0"
