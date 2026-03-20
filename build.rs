@@ -1,7 +1,7 @@
 use std::{env, path::PathBuf};
 
 fn main() {
-	println!("cargo:rustc-link-lib=crypt");
+    println!("cargo:rustc-link-lib=crypt");
 
     let bindings = bindgen::Builder::default()
         .header("src/crypt.h")

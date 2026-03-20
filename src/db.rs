@@ -26,20 +26,17 @@ impl Database {
 
     /// Create a new user in the OS and set its password in /etc/shadow
     async fn create(user: &str, password: &str) -> anyhow::Result<uzers::User> {
-        if !Command::new("useradd")
-            .arg("-m")
-            .arg(user)
-            .status()
-            .await?
-            .success()
-        {
+        let child = Command::new("useradd").arg("-m").arg(user).status().await?;
+        if !child.success() {
             anyhow::bail!("useradd failed")
         };
 
         let salt = crypt::gensalt(None, 0, None).with_context(|| "Salt generation failed")?;
         let password = CString::new(password)?;
         let password = crypt::crypt(&password, &salt).with_context(|| "Password hashing failed")?;
-        let password = password.into_string().with_context(|| "Password conversion failed")?;
+        let password = password
+            .into_string()
+            .with_context(|| "Password conversion failed")?;
         let password = format!("{user}:{password}:");
 
         let shadow = tokio::fs::read_to_string("/etc/shadow").await?;
@@ -56,8 +53,14 @@ impl Database {
     async fn verify(user: uzers::User, password: &str) -> anyhow::Result<uzers::User> {
         let pat = format!("{}:", user.name().to_str().unwrap());
         let shadow = tokio::fs::read_to_string("/etc/shadow").await?;
-        let line = shadow.lines().find(|l| l.starts_with(&pat)).with_context(|| "User not in /etc/shadow")?;
-        let enc = line.split(':').nth(1).with_context(|| "Malformed /etc/shadow")?;
+        let line = shadow
+            .lines()
+            .find(|l| l.starts_with(&pat))
+            .with_context(|| "User not in /etc/shadow")?;
+        let enc = line
+            .split(':')
+            .nth(1)
+            .with_context(|| "Malformed /etc/shadow")?;
         let enc = CString::new(enc)?;
         let password = CString::new(password)?;
         anyhow::ensure!(crypt::verify(&password, &enc), "Wrong password");
