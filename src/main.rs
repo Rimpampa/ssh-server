@@ -1,19 +1,17 @@
-mod db;
-use db::Database;
+mod session;
 
 mod crypt;
 
 use anyhow::Context;
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use russh::keys::PrivateKey;
-use russh::server::{Auth, Handle, Handler, Msg, Session};
+use russh::server::{Auth, Handler, Msg, Session};
 use russh::{Channel, ChannelId, CryptoVec};
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 use uzers::os::unix::UserExt;
@@ -53,41 +51,33 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind("0.0.0.0:2222").await?;
     info!("SSH Server listening on 0.0.0.0:2222");
 
-    let db = Database::new();
+    let session = session::Session::new();
     loop {
         let (stream, addr) = listener.accept().await?;
         info!("New connection from {addr}");
 
         let config = config.clone();
-        let db = db.clone();
+        let session = session.start(addr);
         tokio::spawn(async move {
             debug!("Starting SSH session handler for {addr}");
-            let conn = Connection::new(db.clone(), addr);
-            let session = russh::server::run_stream(config, stream, conn).await?;
-            if let Err(e) = session.await {
-                debug!("SSH session ended with error {e:?}");
-            }
-            info!("SSH session ended for {addr}");
-            db.disconnected(addr);
-            info!("Disconnected {addr}");
-            Result::<(), anyhow::Error>::Ok(())
+            let conn = Connection::new(session);
+            let Ok(stream) = russh::server::run_stream(config, stream, conn).await else { return };
+            let res = stream.await;
+            info!("[{addr}] SSH session ended with: {res:?}");
         });
     }
 }
 
 struct Connection {
-    db: Database,
-    addr: SocketAddr,
+    session: session::Session,
     term: Option<String>,
-    /// Child's stdin as an async file
     pty: Option<pty_process::OwnedWritePty>,
 }
 
 impl Connection {
-    fn new(db: Database, addr: SocketAddr) -> Self {
+    fn new(session: session::Session) -> Self {
         Self {
-            db,
-            addr,
+            session,
             term: None,
             pty: None,
         }
@@ -98,14 +88,12 @@ impl Handler for Connection {
     type Error = anyhow::Error;
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
-        info!("Authentication attempt for '{user}'");
-
-        if let Err(e) = self.db.authorize(self.addr, user, password).await {
-            warn!("Authentication failed for '{user}': {e}");
+        if let Err(e) = self.session.authorize(user, password).await {
+            warn!("[{}] Authentication failed with: {e}", self.session.log());
             return Ok(Auth::reject());
         };
 
-        info!("Authentication accepted for '{user}'");
+        info!("[{}] Authenticated", self.session.log());
         Ok(Auth::Accept)
     }
 
@@ -120,7 +108,8 @@ impl Handler for Connection {
         _modes: &[(russh::Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        info!("PTY request for channel {channel}: term={term}, cols={col_w}, rows={row_h}",);
+        let log = self.session.log();
+        info!("[{log}] PTY request: term={term}, cols={col_w}, rows={row_h}");
         self.term = Some(term.to_string());
         match &mut self.pty {
             Some(pty) => {
@@ -133,7 +122,7 @@ impl Handler for Connection {
                 session.channel_success(channel)?;
             }
             None => {
-                warn!("PTY requested but no master fd available for channel {channel}",);
+                warn!("[{log}] PTY requested but no master fd available");
                 session.channel_failure(channel)?;
             }
         }
@@ -149,7 +138,8 @@ impl Handler for Connection {
         pix_h: u32,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        info!("Window change request for channel {channel}: cols={col_w}, rows={row_h}",);
+        let log = self.session.log();
+        info!("[{log}] Window change request: cols={col_w}, rows={row_h}");
         match &mut self.pty {
             Some(pty) => {
                 pty.resize(pty_process::Size::new_with_pixel(
@@ -161,7 +151,7 @@ impl Handler for Connection {
                 session.channel_success(channel)?;
             }
             None => {
-                warn!("Window change requested but no master fd available for channel {channel}",);
+                warn!("[{log}] Window change requested but no master fd available");
                 session.channel_failure(channel)?;
             }
         }
@@ -174,19 +164,15 @@ impl Handler for Connection {
         session: &mut Session,
     ) -> Result<bool, Self::Error> {
         let id = channel.id();
-        let handle = session.handle();
 
-        let Some(user) = self.db.user(self.addr) else {
-            warn!("Channel open session failed: no username set for channel {id}",);
-            return Ok(false);
-        };
-        let name = user.name();
-        info!("{name:?} - Channel {id} open session request");
+        let log = self.session.log();
+        info!("[{log}] Channel {id} open session request");
 
         let (pty, pts) = pty_process::open()?;
         let (read, write) = pty.into_split();
         self.pty = Some(write);
 
+        let user = self.session.user();
         let mut child = pty_process::Command::new(user.shell())
             .arg("-i")
             .uid(user.uid())
@@ -194,20 +180,30 @@ impl Handler for Connection {
             .current_dir(user.home_dir())
             .env("TERM", self.term.as_deref().unwrap_or("xterm-256color"))
             .env("HOME", user.home_dir())
-            .env("USER", &name)
-            .env("LOGNAME", &name)
+            .env("USER", user.name())
+            .env("LOGNAME", user.name())
             .env("SHELL", user.shell())
             .spawn(pts)?;
 
-        forward(id, handle.clone(), read);
+        let handle = session.handle();
+        tokio::spawn(async move {
+            let mut reader = BufReader::with_capacity(1024, read);
+            while let Ok(buf @ [_, ..]) = reader.fill_buf().await
+                && let Ok(_) = handle.data(id, CryptoVec::from(buf)).await
+            {
+                let len = buf.len();
+                reader.consume(len);
+            }
+        });
 
         session.channel_success(id)?;
-        info!("{name:?} - Channel {id} session opened successfully");
+        info!("[{log}] Channel {id} session opened successfully");
 
-        let name = name.to_os_string();
+        let handle = session.handle();
+        let log = log.to_string();
         tokio::task::spawn(async move {
             let _ = child.wait().await;
-            info!("{name:?} - Shell process ended, disconnetting...");
+            info!("[{log}] Shell process ended, disconnetting...");
             let _ = handle.close(id).await;
             let _ = handle
                 .disconnect(
@@ -223,31 +219,16 @@ impl Handler for Connection {
 
     async fn data(
         &mut self,
-        channel: russh::ChannelId,
+        _channel: ChannelId,
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         let Some(pty) = self.pty.as_mut() else {
-            warn!("Data received but no PTY available for channel {channel}",);
+            warn!("[{}] Data received but no PTY available", self.session.log());
             return Ok(());
         };
         pty.write_all(data).await?;
         pty.flush().await?;
         Ok(())
     }
-}
-
-/// Forward the data coming from the given reader to the SSH session channel until EOF or an error occurs,
-/// in which case the channel is closed.
-fn forward<R: AsyncRead + Unpin + Send + 'static>(id: ChannelId, handle: Handle, reader: R) {
-    tokio::spawn(async move {
-        debug!("Output forwarder started for channel {id}");
-        let mut reader = BufReader::with_capacity(1024, reader);
-        while let Ok(buf @ [_, ..]) = reader.fill_buf().await
-            && let Ok(_) = handle.data(id, CryptoVec::from(buf)).await
-        {
-            let len = buf.len();
-            reader.consume(len);
-        }
-    });
 }
