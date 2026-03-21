@@ -13,7 +13,7 @@ use russh::keys::PrivateKey;
 use russh::server::{Auth, Handle, Handler, Msg, Session};
 use russh::{Channel, ChannelId, CryptoVec};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 use uzers::os::unix::UserExt;
@@ -173,13 +173,15 @@ impl Handler for Connection {
         channel: Channel<Msg>,
         session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        let channel_id = channel.id();
+        let id = channel.id();
+        let handle = session.handle();
+
         let Some(user) = self.db.user(self.addr) else {
-            warn!("Channel open session failed: no username set for channel {channel_id}",);
+            warn!("Channel open session failed: no username set for channel {id}",);
             return Ok(false);
         };
         let name = user.name();
-        info!("{name:?} - Channel {channel_id} open session request");
+        info!("{name:?} - Channel {id} open session request");
 
         let (pty, pts) = pty_process::open()?;
         let (read, write) = pty.into_split();
@@ -197,15 +199,23 @@ impl Handler for Connection {
             .env("SHELL", user.shell())
             .spawn(pts)?;
 
-        forward(channel_id, session.handle(), read);
+        forward(id, handle.clone(), read);
 
-        session.channel_success(channel_id)?;
-        info!("{name:?} - Channel {channel_id} session opened successfully");
+        session.channel_success(id)?;
+        info!("{name:?} - Channel {id} session opened successfully");
 
         let name = name.to_os_string();
         tokio::task::spawn(async move {
             let _ = child.wait().await;
-            info!("{name:?} - Shell process ended");
+            info!("{name:?} - Shell process ended, disconnetting...");
+            let _ = handle.close(id).await;
+            let _ = handle
+                .disconnect(
+                    russh::Disconnect::ByApplication,
+                    "User requested exit".into(),
+                    "".into(),
+                )
+                .await;
         });
 
         Ok(true)
@@ -232,24 +242,12 @@ impl Handler for Connection {
 fn forward<R: AsyncRead + Unpin + Send + 'static>(id: ChannelId, handle: Handle, reader: R) {
     tokio::spawn(async move {
         debug!("Output forwarder started for channel {id}");
-        let mut reader = BufReader::new(reader);
-        let mut buf = vec![0u8; 1024];
-        loop {
-            let res = reader.read(&mut buf).await;
-            if let Err(e) = &res {
-                error!("Output forwarder error on channel {id}: {e}");
-            }
-            let _ = match res {
-                Ok(0) | Err(_) => break,
-                Ok(n) => handle.data(id, CryptoVec::from(&buf[..n])).await,
-            };
+        let mut reader = BufReader::with_capacity(1024, reader);
+        while let Ok(buf @ [_, ..]) = reader.fill_buf().await
+            && let Ok(_) = handle.data(id, CryptoVec::from(buf)).await
+        {
+            let len = buf.len();
+            reader.consume(len);
         }
-        info!("Child process ended, closing channel {id} and disconnecting...");
-        let _ = handle.close(id);
-        let _ = handle.disconnect(
-            russh::Disconnect::ByApplication,
-            "User requested exit".into(),
-            "".into(),
-        );
     });
 }
