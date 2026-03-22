@@ -46,6 +46,7 @@ unsafe extern "C" fn conversation(
     appdata_ptr: *mut c_void,
 ) -> c_int {
     let Ok(num_msg) = num_msg.try_into() else {
+        log::debug!("PAM conversation: invalid num_msg {num_msg}");
         return ffi::PAM_CONV_ERR as c_int;
     };
 
@@ -59,16 +60,47 @@ unsafe extern "C" fn conversation(
 
     // SAFETY: todo
     let Some(responses) = (unsafe { malloc::<ffi::pam_response>(num_msg) }) else {
+        log::debug!("PAM conversation: malloc failed for {num_msg} responses");
         return ffi::PAM_BUF_ERR.cast_signed();
     };
 
     for (r, m) in responses.iter_mut().zip(msg) {
-        let resp = match m.msg_style.cast_unsigned() {
-            ffi::PAM_PROMPT_ECHO_OFF => unsafe { malloc_cstr(&creds.password) }.map(|s| s.as_mut_ptr()),
-            ffi::PAM_PROMPT_ECHO_ON => unsafe { malloc_cstr(&creds.username) }.map(|s| s.as_mut_ptr()),
-            _ => Some(std::ptr::null_mut()),
+        let msg_text = if m.msg.is_null() {
+            String::new()
+        } else {
+            // SAFETY: PAM guarantees msg is a valid null-terminated string when non-null
+            unsafe { std::ffi::CStr::from_ptr(m.msg) }
+                .to_str()
+                .unwrap_or("<invalid utf8>")
+                .to_owned()
         };
-        let Some(resp) = resp else { return ffi::PAM_BUF_ERR.cast_signed() };
+
+        let resp = match m.msg_style.cast_unsigned() {
+            ffi::PAM_PROMPT_ECHO_OFF => {
+                log::debug!("PAM conversation: prompt (hidden): {msg_text:?}");
+                unsafe { malloc_cstr(&creds.password) }.map(|s| s.as_mut_ptr())
+            }
+            ffi::PAM_PROMPT_ECHO_ON => {
+                log::debug!("PAM conversation: prompt (visible): {msg_text:?}");
+                unsafe { malloc_cstr(&creds.username) }.map(|s| s.as_mut_ptr())
+            }
+            ffi::PAM_ERROR_MSG => {
+                log::debug!("PAM conversation: error message: {msg_text:?}");
+                Some(std::ptr::null_mut())
+            }
+            ffi::PAM_TEXT_INFO => {
+                log::debug!("PAM conversation: info message: {msg_text:?}");
+                Some(std::ptr::null_mut())
+            }
+            style => {
+                log::debug!("PAM conversation: unknown msg_style {style}: {msg_text:?}");
+                Some(std::ptr::null_mut())
+            }
+        };
+        let Some(resp) = resp else {
+            log::debug!("PAM conversation: malloc_cstr failed");
+            return ffi::PAM_BUF_ERR.cast_signed();
+        };
         r.write(ffi::pam_response {
             resp,
             resp_retcode: 0,
@@ -131,8 +163,13 @@ impl PamSession {
         str.to_str().unwrap_or("* invalid *")
     }
 
-    fn result(&mut self, result: c_int) -> anyhow::Result<&mut Self> {
+    fn result(&mut self, step: &str, result: c_int) -> anyhow::Result<&mut Self> {
         self.status = result.cast_unsigned();
+        if self.status == ffi::PAM_SUCCESS {
+            log::debug!("PAM {step}: ok");
+        } else {
+            log::debug!("PAM {step}: failed — {}", self.status_str());
+        }
         anyhow::ensure!(self.status == ffi::PAM_SUCCESS, self.status_str());
         Ok(self)
     }
@@ -147,32 +184,32 @@ impl PamSession {
                 &mut self.handle,
             )
         };
-        self.result(res)
+        self.result("pam_start", res)
     }
 
     fn authenticate_(&mut self) -> anyhow::Result<&mut Self> {
         // SAFETY: todo
-        self.result(unsafe { ffi::pam_authenticate(self.handle, 0) })
+        self.result("pam_authenticate", unsafe { ffi::pam_authenticate(self.handle, 0) })
     }
 
     fn acct_mgmt(&mut self) -> anyhow::Result<&mut Self> {
         // SAFETY: todo
-        self.result(unsafe { ffi::pam_acct_mgmt(self.handle, 0) })
+        self.result("pam_acct_mgmt", unsafe { ffi::pam_acct_mgmt(self.handle, 0) })
     }
 
     fn setcred(&mut self) -> anyhow::Result<&mut Self> {
         // SAFETY: todo
-        self.result(unsafe { ffi::pam_setcred(self.handle, ffi::PAM_ESTABLISH_CRED as c_int) })
+        self.result("pam_setcred(establish)", unsafe { ffi::pam_setcred(self.handle, ffi::PAM_ESTABLISH_CRED as c_int) })
     }
 
     fn open_session(&mut self) -> anyhow::Result<&mut Self> {
         // SAFETY: todo
-        self.result(unsafe { ffi::pam_open_session(self.handle, 0) })
+        self.result("pam_open_session", unsafe { ffi::pam_open_session(self.handle, 0) })
     }
 
     fn reinitialize_cred(&mut self) -> anyhow::Result<&mut Self> {
         // SAFETY: todo
-        self.result(unsafe { ffi::pam_setcred(self.handle, ffi::PAM_REINITIALIZE_CRED as c_int) })
+        self.result("pam_setcred(reinitialize)", unsafe { ffi::pam_setcred(self.handle, ffi::PAM_REINITIALIZE_CRED as c_int) })
     }
 
     /// Authenticate `username`/`password` against the `"ssh-server"` PAM service
