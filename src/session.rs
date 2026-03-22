@@ -8,15 +8,18 @@ use tokio::process::Command;
 use anyhow::Context;
 
 use crate::crypt;
+use crate::pam_auth::PamSession;
 
 pub type Database = HashMap<String, Option<SocketAddr>>;
 
-#[derive(Clone)]
 pub struct Session {
     db: Arc<Mutex<Database>>,
     addr: SocketAddr,
     user: uzers::User,
     log: String,
+    /// Holds the open PAM session for the authenticated user.
+    /// `None` before authentication; `Some` afterwards.
+    pam_session: Option<PamSession>,
 }
 
 impl Session {
@@ -26,6 +29,7 @@ impl Session {
             addr: ([0; 4], 0).into(),
             user: uzers::User::new(0, "root", 0),
             log: String::new(),
+            pam_session: None,
         }
     }
 
@@ -35,6 +39,7 @@ impl Session {
             addr,
             user: self.user.clone(),
             log: format!("???@{addr}"),
+            pam_session: None,
         }
     }
 
@@ -44,22 +49,37 @@ impl Session {
             anyhow::bail!("root login is not allowed")
         }
 
+        // Ensure the OS user exists before handing off to PAM.
+        // For new users we create the account and pre-set the password so that
+        // the standard pam_unix module can authenticate them immediately after.
         self.user = match uzers::get_user_by_name(name) {
             None => {
                 create(name, password).await?;
                 uzers::get_user_by_name(name)
                     .with_context(|| "create function somehow failed without error")?
             }
-            Some(user) => {
-                verify(name, password).await?;
-                user
-            }
+            Some(user) => user,
         };
+
+        // Authenticate and open a PAM session.  This replaces the previous
+        // direct /etc/shadow verification and gives the PAM stack (pam_unix,
+        // pam_limits, pam_env, …) a chance to run all of its modules.
+        // PamSession::open performs pam_authenticate + pam_acct_mgmt +
+        // pam_open_session; dropping the value later closes the session.
+        let pam = tokio::task::spawn_blocking({
+            let name = name.to_owned();
+            let password = password.to_owned();
+            move || PamSession::open(&name, &password)
+        })
+        .await
+        .with_context(|| "PAM task panicked")??;
+
+        self.pam_session = Some(pam);
         self.log = format!("{name}@{}", self.addr);
 
         let mut lock = self.db.lock().unwrap();
         match lock.entry(name.into()).or_default() {
-            Some(addr) => anyhow::bail!("Already logged-in from {addr}",),
+            Some(addr) => anyhow::bail!("Already logged-in from {addr}"),
             entry @ None => *entry = Some(self.addr),
         }
         Ok(())
@@ -87,7 +107,8 @@ impl Drop for Session {
     }
 }
 
-/// Create a new user in the OS and set its password in /etc/shadow
+/// Create a new user in the OS and set its password in /etc/shadow so that
+/// pam_unix can authenticate the user immediately afterwards.
 async fn create(name: &str, password: &str) -> anyhow::Result<()> {
     let salt = crypt::gensalt(None, 0, None).with_context(|| "Salt generation failed")?;
     let password = CString::new(password)?;
@@ -104,23 +125,5 @@ async fn create(name: &str, password: &str) -> anyhow::Result<()> {
         .status()
         .await?;
     anyhow::ensure!(child.success(), "useradd failed");
-    Ok(())
-}
-
-/// Verify that the given existing user as the provided password in /etc/shadow
-async fn verify(name: &str, password: &str) -> anyhow::Result<()> {
-    let pat = format!("{name}:");
-    let shadow = tokio::fs::read_to_string("/etc/shadow").await?;
-    let line = shadow
-        .lines()
-        .find(|l| l.starts_with(&pat))
-        .with_context(|| "User not in /etc/shadow")?;
-    let enc = line
-        .split(':')
-        .nth(1)
-        .with_context(|| "Malformed /etc/shadow")?;
-    let enc = CString::new(enc)?;
-    let password = CString::new(password)?;
-    anyhow::ensure!(crypt::verify(&password, &enc), "Wrong password");
     Ok(())
 }
