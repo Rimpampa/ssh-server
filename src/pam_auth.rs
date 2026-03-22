@@ -58,7 +58,7 @@ unsafe extern "C" fn conversation(
     let msg = unsafe { std::slice::from_raw_parts_mut(msg as *mut &ffi::pam_message, num_msg) };
 
     // SAFETY: todo
-    let Some(responses) = unsafe { malloc::<ffi::pam_response>(num_msg) } else {
+    let Some(responses) = (unsafe { malloc::<ffi::pam_response>(num_msg) }) else {
         return ffi::PAM_BUF_ERR.cast_signed();
     };
 
@@ -165,52 +165,27 @@ impl PamSession {
         self.result(unsafe { ffi::pam_setcred(self.handle, ffi::PAM_ESTABLISH_CRED as c_int) })
     }
 
-    fn end(&mut self) -> anyhow::Result<&mut Self> {
+    fn open_session(&mut self) -> anyhow::Result<&mut Self> {
         // SAFETY: todo
-        self.result(unsafe { ffi::pam_end(self.handle, 0) })
+        self.result(unsafe { ffi::pam_open_session(self.handle, 0) })
     }
 
-    /// Authenticate `username`/`password` against the `"ssh-server"` PAM service.
+    fn reinitialize_cred(&mut self) -> anyhow::Result<&mut Self> {
+        // SAFETY: todo
+        self.result(unsafe { ffi::pam_setcred(self.handle, ffi::PAM_REINITIALIZE_CRED as c_int) })
+    }
+
+    /// Authenticate `username`/`password` against the `"ssh-server"` PAM service
+    /// and open a session.
     ///
     /// Runs `pam_start` → `pam_authenticate` → `pam_acct_mgmt` →
-    /// `pam_setcred(ESTABLISH)` in the **parent** process. The session is not
-    /// opened here; call [`child_setup`] and pass its result to
-    /// `Command::pre_exec` so that `pam_open_session` runs in the child
-    /// process (after fork, before exec), tying resource limits and accounting
-    /// to the shell's lifetime.
-    pub fn authenticate(username: &str, password: &str) -> anyhow::Result<Self> {
+    /// `pam_setcred(ESTABLISH)` → `pam_open_session` → `pam_setcred(REINITIALIZE)`.
+    /// Dropping the returned value closes the session via `pam_close_session`,
+    /// `pam_setcred(DELETE)`, and `pam_end`.
+    pub fn open(username: &str, password: &str) -> anyhow::Result<Self> {
         let mut handle = Self::null(username, password)?;
-        handle.start()?.authenticate_()?.acct_mgmt()?.setcred()?;
+        handle.start()?.authenticate_()?.acct_mgmt()?.setcred()?.open_session()?.reinitialize_cred()?;
         Ok(handle)
-    }
-
-    /// Returns a closure intended for use with `Command::pre_exec`.
-    ///
-    /// The closure runs in the **child** process after `fork` and before
-    /// `exec`. It calls `pam_open_session` (which applies resource limits via
-    /// `pam_limits`, writes utmp/wtmp login records, etc.) and then
-    /// `pam_setcred(REINITIALIZE)`, both of which must take effect in the
-    /// child so that the shell inherits them.
-    ///
-    /// `pam_close_session` is called from the parent when [`PamSession`] is
-    /// dropped (i.e. when the SSH connection ends), writing the logout record.
-    pub fn child_setup(&self) -> impl FnMut() -> std::io::Result<()> + Send + 'static {
-        // Cast to usize so the closure is `Send` — usize is always Send.
-        // The address remains valid in the child because fork copies the entire
-        // parent address space; the pointer is used before exec replaces it.
-        let handle = self.handle as usize;
-        move || {
-            let handle = handle as *mut ffi::pam_handle_t;
-            let rc = unsafe { ffi::pam_open_session(handle, 0) };
-            if rc != ffi::PAM_SUCCESS as c_int {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("pam_open_session failed (PAM error code {rc})"),
-                ));
-            }
-            unsafe { ffi::pam_setcred(handle, ffi::PAM_REINITIALIZE_CRED as c_int) };
-            Ok(())
-        }
     }
 }
 
