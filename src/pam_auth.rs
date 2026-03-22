@@ -90,9 +90,15 @@ pub struct PamSession {
 unsafe impl Send for PamSession {}
 
 impl PamSession {
-    /// Authenticate `username`/`password` against the `"sshd"` PAM service
-    /// and open a session.
-    pub fn open(username: &str, password: &str) -> anyhow::Result<Self> {
+    /// Authenticate `username`/`password` against the `"sshd"` PAM service.
+    ///
+    /// Runs `pam_start` → `pam_authenticate` → `pam_acct_mgmt` →
+    /// `pam_setcred(ESTABLISH)` in the **parent** process. The session is not
+    /// opened here; call [`child_setup`] and pass its result to
+    /// `Command::pre_exec` so that `pam_open_session` runs in the child
+    /// process (after fork, before exec), tying resource limits and accounting
+    /// to the shell's lifetime.
+    pub fn authenticate(username: &str, password: &str) -> anyhow::Result<Self> {
         let service = CString::new("sshd")?;
         let user = CString::new(username)?;
 
@@ -101,8 +107,6 @@ impl PamSession {
             password: CString::new(password)?,
         });
 
-        // `conv.appdata_ptr` points into `creds`; both are moved into the
-        // returned `PamSession` so they stay alive for the duration.
         let conv = Box::new(ffi::pam_conv {
             conv: Some(conversation),
             appdata_ptr: &*creds as *const Credentials as *mut c_void,
@@ -123,8 +127,6 @@ impl PamSession {
         pam!(ffi::pam_authenticate(handle, 0), "pam_authenticate");
         pam!(ffi::pam_acct_mgmt(handle, 0), "pam_acct_mgmt");
         pam!(ffi::pam_setcred(handle, ffi::PAM_ESTABLISH_CRED as c_int), "pam_setcred(establish)");
-        pam!(ffi::pam_open_session(handle, 0), "pam_open_session");
-        pam!(ffi::pam_setcred(handle, ffi::PAM_REINITIALIZE_CRED as c_int), "pam_setcred(reinitialize)");
 
         Ok(Self {
             handle,
@@ -132,6 +134,35 @@ impl PamSession {
             _conv: conv,
             _creds: creds,
         })
+    }
+
+    /// Returns a closure intended for use with `Command::pre_exec`.
+    ///
+    /// The closure runs in the **child** process after `fork` and before
+    /// `exec`. It calls `pam_open_session` (which applies resource limits via
+    /// `pam_limits`, writes utmp/wtmp login records, etc.) and then
+    /// `pam_setcred(REINITIALIZE)`, both of which must take effect in the
+    /// child so that the shell inherits them.
+    ///
+    /// `pam_close_session` is called from the parent when [`PamSession`] is
+    /// dropped (i.e. when the SSH connection ends), writing the logout record.
+    pub fn child_setup(&self) -> impl FnMut() -> std::io::Result<()> + Send + 'static {
+        // Cast to usize so the closure is `Send` — usize is always Send.
+        // The address remains valid in the child because fork copies the entire
+        // parent address space; the pointer is used before exec replaces it.
+        let handle = self.handle as usize;
+        move || {
+            let handle = handle as *mut ffi::pam_handle_t;
+            let rc = unsafe { ffi::pam_open_session(handle, 0) };
+            if rc != ffi::PAM_SUCCESS as c_int {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("pam_open_session failed (PAM error code {rc})"),
+                ));
+            }
+            unsafe { ffi::pam_setcred(handle, ffi::PAM_REINITIALIZE_CRED as c_int) };
+            Ok(())
+        }
     }
 }
 
