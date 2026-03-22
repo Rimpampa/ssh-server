@@ -1,6 +1,6 @@
 mod session;
-
 mod crypt;
+mod pam_auth;
 
 use anyhow::Context;
 
