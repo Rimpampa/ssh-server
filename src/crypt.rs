@@ -58,7 +58,3 @@ pub fn crypt(password: &CStr, salt: &CStr) -> Option<CString> {
     // SAFETY: it's a valid pointer to a null-terminated string
     Some(unsafe { CStr::from_ptr(ptr) }.into())
 }
-
-pub fn verify(password: &CStr, encrypted: &CStr) -> bool {
-    crypt(password, encrypted).as_deref() == Some(encrypted)
-}

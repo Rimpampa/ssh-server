@@ -1,8 +1,9 @@
-mod session;
 mod crypt;
 mod pam_auth;
+mod session;
 
 use anyhow::Context;
+use tokio::process::Child;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,7 +62,9 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             debug!("Starting SSH session handler for {addr}");
             let conn = Connection::new(session);
-            let Ok(stream) = russh::server::run_stream(config, stream, conn).await else { return };
+            let Ok(stream) = russh::server::run_stream(config, stream, conn).await else {
+                return;
+            };
             let res = stream.await;
             info!("[{addr}] SSH session ended with: {res:?}");
         });
@@ -72,6 +75,8 @@ struct Connection {
     session: session::Session,
     term: Option<String>,
     pty: Option<pty_process::OwnedWritePty>,
+    read: Option<pty_process::OwnedReadPty>,
+    child: Option<Child>,
 }
 
 impl Connection {
@@ -80,6 +85,8 @@ impl Connection {
             session,
             term: None,
             pty: None,
+            read: None,
+            child: None,
         }
     }
 }
@@ -92,6 +99,26 @@ impl Handler for Connection {
             warn!("[{}] Authentication failed with: {e}", self.session.log());
             return Ok(Auth::reject());
         };
+
+        let (pty, pts) = pty_process::open()?;
+        let (read, write) = pty.into_split();
+        self.pty = Some(write);
+        self.read = Some(read);
+
+        let user = self.session.user();
+        let pam_setup = self.session.pam_child_setup();
+        let command = pty_process::Command::new(user.shell())
+            .arg("-i")
+            .uid(user.uid())
+            .gid(user.primary_group_id())
+            .current_dir(user.home_dir())
+            .env("TERM", self.term.as_deref().unwrap_or("xterm-256color"))
+            .env("HOME", user.home_dir())
+            .env("USER", user.name())
+            .env("LOGNAME", user.name())
+            .env("SHELL", user.shell());
+        let command = unsafe { command.pre_exec(pam_setup) };
+        self.child = Some(command.spawn(pts)?);
 
         info!("[{}] Authenticated", self.session.log());
         Ok(Auth::Accept)
@@ -168,24 +195,11 @@ impl Handler for Connection {
         let log = self.session.log();
         info!("[{log}] Channel {id} open session request");
 
-        let (pty, pts) = pty_process::open()?;
-        let (read, write) = pty.into_split();
-        self.pty = Some(write);
-
-        let user = self.session.user();
-        let mut child = pty_process::Command::new(user.shell())
-            .arg("-i")
-            .uid(user.uid())
-            .gid(user.primary_group_id())
-            .current_dir(user.home_dir())
-            .env("TERM", self.term.as_deref().unwrap_or("xterm-256color"))
-            .env("HOME", user.home_dir())
-            .env("USER", user.name())
-            .env("LOGNAME", user.name())
-            .env("SHELL", user.shell())
-            .spawn(pts)?;
-
         let handle = session.handle();
+        let read = self
+            .read
+            .take()
+            .with_context(|| "Missing read half of PTY")?;
         tokio::spawn(async move {
             let mut reader = BufReader::with_capacity(1024, read);
             while let Ok(buf @ [_, ..]) = reader.fill_buf().await
@@ -201,6 +215,7 @@ impl Handler for Connection {
 
         let handle = session.handle();
         let log = log.to_string();
+        let mut child = self.child.take().with_context(|| "Missing child process handle")?;
         tokio::task::spawn(async move {
             let _ = child.wait().await;
             info!("[{log}] Shell process ended, disconnetting...");
@@ -224,7 +239,10 @@ impl Handler for Connection {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         let Some(pty) = self.pty.as_mut() else {
-            warn!("[{}] Data received but no PTY available", self.session.log());
+            warn!(
+                "[{}] Data received but no PTY available",
+                self.session.log()
+            );
             return Ok(());
         };
         pty.write_all(data).await?;
