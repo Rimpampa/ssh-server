@@ -78,6 +78,10 @@ impl Session {
         self.user.name().to_str().unwrap_or("") // <-- should be unreachable
     }
 
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
     pub fn log(&self) -> &str {
         &self.log
     }

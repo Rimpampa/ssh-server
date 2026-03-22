@@ -2,10 +2,13 @@ mod session;
 
 mod crypt;
 
+mod utmp;
+
 use anyhow::Context;
 
 use std::sync::Arc;
 use std::time::Duration;
+use std::os::unix::io::AsRawFd;
 
 use russh::keys::PrivateKey;
 use russh::server::{Auth, Handler, Msg, Session};
@@ -169,6 +172,19 @@ impl Handler for Connection {
         info!("[{log}] Channel {id} open session request");
 
         let (pty, pts) = pty_process::open()?;
+
+        // Get the pts device name (e.g. "pts/0") for utmp before pts is consumed by spawn.
+        let pts_line = unsafe {
+            let mut buf = [0i8; 256];
+            let ret = libc::ttyname_r(pts.as_raw_fd(), buf.as_mut_ptr(), buf.len());
+            if ret == 0 {
+                let s = std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy();
+                s.strip_prefix("/dev/").unwrap_or(&s).to_string()
+            } else {
+                "pts/0".to_string()
+            }
+        };
+
         let (read, write) = pty.into_split();
         self.pty = Some(write);
 
@@ -184,6 +200,11 @@ impl Handler for Connection {
             .env("LOGNAME", user.name())
             .env("SHELL", user.shell())
             .spawn(pts)?;
+
+        let child_pid = child.id().unwrap_or(0);
+        let username = self.session.name().to_string();
+        let remote_host = self.session.addr().ip().to_string();
+        utmp::write_login(&username, child_pid, &pts_line, &remote_host);
 
         let handle = session.handle();
         tokio::spawn(async move {
@@ -203,6 +224,7 @@ impl Handler for Connection {
         let log = log.to_string();
         tokio::task::spawn(async move {
             let _ = child.wait().await;
+            utmp::write_logout(&pts_line);
             info!("[{log}] Shell process ended, disconnetting...");
             let _ = handle.close(id).await;
             let _ = handle
