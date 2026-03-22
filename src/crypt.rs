@@ -8,7 +8,7 @@ use std::ptr::null;
 mod ffi {
     #![allow(unused)]
 
-    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+    include!(concat!(env!("OUT_DIR"), "/crypt.rs"));
 }
 
 // pub fn preferred_method() -> Option<&'static CStr> {
