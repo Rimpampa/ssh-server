@@ -13,9 +13,10 @@
 
 #![allow(non_upper_case_globals)]
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
+use std::mem::{MaybeUninit, size_of};
 use std::os::raw::{c_int, c_void};
-use std::ptr;
+use std::ptr::{self, NonNull};
 
 mod ffi {
     #![allow(unused)]
@@ -36,38 +37,46 @@ struct Credentials {
 /// Responds with the password for `PAM_PROMPT_ECHO_OFF` prompts and the
 /// username for `PAM_PROMPT_ECHO_ON` prompts.
 ///
-/// Response strings are allocated with `libc::strdup` so that the PAM library
-/// can `free()` them with its own allocator. The response array itself is
-/// allocated with `libc::malloc` for the same reason.
+/// Response buffer and strings are allocated with `libc::malloc` so that the PAM
+/// library can `free()` them with its own allocator.
 unsafe extern "C" fn conversation(
     num_msg: c_int,
     msg: *mut *const ffi::pam_message,
     resp: *mut *mut ffi::pam_response,
     appdata_ptr: *mut c_void,
 ) -> c_int {
-    unsafe {
-        let creds = &*(appdata_ptr as *const Credentials);
+    let Ok(num_msg) = num_msg.try_into() else {
+        return ffi::PAM_CONV_ERR as c_int;
+    };
 
-        let responses = libc::malloc(num_msg as usize * std::mem::size_of::<ffi::pam_response>())
-            as *mut ffi::pam_response;
-        if responses.is_null() {
-            return ffi::PAM_BUF_ERR as c_int;
-        }
+    // SAFETY: this function is only called in `PamSession::authenticate` which always
+    // sets the `appdata_ptr` to a pointer to a value of type `Credentials`
+    let creds = unsafe { &*appdata_ptr.cast::<Credentials>() };
 
-        for i in 0..num_msg as usize {
-            let m = &**msg.add(i);
-            let r = &mut *responses.add(i);
-            r.resp_retcode = 0;
-            r.resp = match m.msg_style {
-                s if s == ffi::PAM_PROMPT_ECHO_OFF as c_int => libc::strdup(creds.password.as_ptr()),
-                s if s == ffi::PAM_PROMPT_ECHO_ON as c_int => libc::strdup(creds.username.as_ptr()),
-                _ => ptr::null_mut(),
-            };
-        }
+    // SAFETY: in theory in `msg` we have exclusive access to an array
+    // of references to initialized `pam_message` items
+    let msg = unsafe { std::slice::from_raw_parts_mut(msg as *mut &ffi::pam_message, num_msg) };
 
-        *resp = responses;
-        ffi::PAM_SUCCESS as c_int
+    // SAFETY: todo
+    let Some(responses) = unsafe { malloc::<ffi::pam_response>(num_msg) } else {
+        return ffi::PAM_BUF_ERR.cast_signed();
+    };
+
+    for (r, m) in responses.iter_mut().zip(msg) {
+        let resp = match m.msg_style.cast_unsigned() {
+            ffi::PAM_PROMPT_ECHO_OFF => unsafe { malloc_cstr(&creds.password) }.map(|s| s.as_mut_ptr()),
+            ffi::PAM_PROMPT_ECHO_ON => unsafe { malloc_cstr(&creds.username) }.map(|s| s.as_mut_ptr()),
+            _ => Some(std::ptr::null_mut()),
+        };
+        let Some(resp) = resp else { return ffi::PAM_BUF_ERR.cast_signed() };
+        r.write(ffi::pam_response {
+            resp,
+            resp_retcode: 0,
+        });
     }
+    // SAFETY: the PAM library guarantees that resp is a pointer to a pam_response
+    unsafe { *resp = responses.as_mut_ptr() as *mut _ };
+    ffi::PAM_SUCCESS as c_int
 }
 
 // ── PamSession ────────────────────────────────────────────────────────────────
@@ -78,11 +87,11 @@ unsafe extern "C" fn conversation(
 /// and ends the PAM transaction.
 pub struct PamSession {
     handle: *mut ffi::pam_handle_t,
-    last_status: c_int,
+    status: u32,
     // Both fields below must outlive `handle`: Linux-PAM stores a pointer to
-    // `_conv` internally, and `_conv.appdata_ptr` points into `_creds`.
-    _conv: Box<ffi::pam_conv>,
-    _creds: Box<Credentials>,
+    // `conv` internally, and `conv.appdata_ptr` points into `creds`.
+    conv: Box<ffi::pam_conv>,
+    creds: Box<Credentials>,
 }
 
 // SAFETY: the PAM handle is owned exclusively by this struct; we never share
@@ -90,18 +99,7 @@ pub struct PamSession {
 unsafe impl Send for PamSession {}
 
 impl PamSession {
-    /// Authenticate `username`/`password` against the `"sshd"` PAM service.
-    ///
-    /// Runs `pam_start` → `pam_authenticate` → `pam_acct_mgmt` →
-    /// `pam_setcred(ESTABLISH)` in the **parent** process. The session is not
-    /// opened here; call [`child_setup`] and pass its result to
-    /// `Command::pre_exec` so that `pam_open_session` runs in the child
-    /// process (after fork, before exec), tying resource limits and accounting
-    /// to the shell's lifetime.
-    pub fn authenticate(username: &str, password: &str) -> anyhow::Result<Self> {
-        let service = CString::new("sshd")?;
-        let user = CString::new(username)?;
-
+    fn null(username: &str, password: &str) -> anyhow::Result<Self> {
         let creds = Box::new(Credentials {
             username: CString::new(username)?,
             password: CString::new(password)?,
@@ -112,28 +110,78 @@ impl PamSession {
             appdata_ptr: &*creds as *const Credentials as *mut c_void,
         });
 
-        let mut handle: *mut ffi::pam_handle_t = ptr::null_mut();
-
-        macro_rules! pam {
-            ($call:expr, $msg:literal) => {{
-                let rc = unsafe { $call };
-                if rc != ffi::PAM_SUCCESS as c_int {
-                    anyhow::bail!(concat!($msg, " failed (PAM error code {})"), rc);
-                }
-            }};
-        }
-
-        pam!(ffi::pam_start(service.as_ptr(), user.as_ptr(), &*conv, &mut handle), "pam_start");
-        pam!(ffi::pam_authenticate(handle, 0), "pam_authenticate");
-        pam!(ffi::pam_acct_mgmt(handle, 0), "pam_acct_mgmt");
-        pam!(ffi::pam_setcred(handle, ffi::PAM_ESTABLISH_CRED as c_int), "pam_setcred(establish)");
-
         Ok(Self {
-            handle,
-            last_status: ffi::PAM_SUCCESS as c_int,
-            _conv: conv,
-            _creds: creds,
+            handle: std::ptr::null_mut(),
+            status: ffi::PAM_SUCCESS,
+            conv,
+            creds,
         })
+    }
+
+    fn status_str(&self) -> &'static str {
+        // SAFETY: todo
+        let ptr = unsafe { ffi::pam_strerror(self.handle, self.status.cast_signed()) };
+        if ptr.is_null() {
+            return "* null *";
+        }
+        // SAFETY: if the pointer returned by pam_strerror is not null then it's
+        // guaranteed to point to a null-terminated byte string
+        let str = unsafe { CStr::from_ptr(ptr) };
+
+        str.to_str().unwrap_or("* invalid *")
+    }
+
+    fn result(&mut self, result: c_int) -> anyhow::Result<&mut Self> {
+        self.status = result.cast_unsigned();
+        anyhow::ensure!(self.status == ffi::PAM_SUCCESS, self.status_str());
+        Ok(self)
+    }
+
+    fn start(&mut self) -> anyhow::Result<&mut Self> {
+        // SAFETY: todo
+        let res = unsafe {
+            ffi::pam_start(
+                c"ssh-server".as_ptr(),
+                self.creds.username.as_ptr(),
+                &*self.conv,
+                &mut self.handle,
+            )
+        };
+        self.result(res)
+    }
+
+    fn authenticate_(&mut self) -> anyhow::Result<&mut Self> {
+        // SAFETY: todo
+        self.result(unsafe { ffi::pam_authenticate(self.handle, 0) })
+    }
+
+    fn acct_mgmt(&mut self) -> anyhow::Result<&mut Self> {
+        // SAFETY: todo
+        self.result(unsafe { ffi::pam_acct_mgmt(self.handle, 0) })
+    }
+
+    fn setcred(&mut self) -> anyhow::Result<&mut Self> {
+        // SAFETY: todo
+        self.result(unsafe { ffi::pam_setcred(self.handle, ffi::PAM_ESTABLISH_CRED as c_int) })
+    }
+
+    fn end(&mut self) -> anyhow::Result<&mut Self> {
+        // SAFETY: todo
+        self.result(unsafe { ffi::pam_end(self.handle, 0) })
+    }
+
+    /// Authenticate `username`/`password` against the `"ssh-server"` PAM service.
+    ///
+    /// Runs `pam_start` → `pam_authenticate` → `pam_acct_mgmt` →
+    /// `pam_setcred(ESTABLISH)` in the **parent** process. The session is not
+    /// opened here; call [`child_setup`] and pass its result to
+    /// `Command::pre_exec` so that `pam_open_session` runs in the child
+    /// process (after fork, before exec), tying resource limits and accounting
+    /// to the shell's lifetime.
+    pub fn authenticate(username: &str, password: &str) -> anyhow::Result<Self> {
+        let mut handle = Self::null(username, password)?;
+        handle.start()?.authenticate_()?.acct_mgmt()?.setcred()?;
+        Ok(handle)
     }
 
     /// Returns a closure intended for use with `Command::pre_exec`.
@@ -175,8 +223,39 @@ impl Drop for PamSession {
         unsafe {
             ffi::pam_close_session(self.handle, 0);
             ffi::pam_setcred(self.handle, ffi::PAM_DELETE_CRED as c_int);
-            ffi::pam_end(self.handle, self.last_status);
+            ffi::pam_end(self.handle, self.status.cast_signed());
         }
         self.handle = ptr::null_mut();
     }
+}
+
+/// Utility function to allocate a slice with [`libc::malloc`]
+///
+/// # Safety
+///
+/// Same as [`libc::malloc`]
+unsafe fn malloc<T>(len: usize) -> Option<&'static mut [MaybeUninit<T>]> {
+    let size = len * size_of::<T>();
+    // SAFETY: caller must ensure the safety requirements of malloc
+    let ptr = unsafe { libc::malloc(size) };
+    let ptr = NonNull::new(ptr as *mut MaybeUninit<T>)?;
+    // SAFETY: given that the pointer is not null, malloc didn't fail and thus
+    // we have gained exclusive access to an unitialized slice of len T items
+    Some(unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), len) })
+}
+
+/// Utility function to allocate a C null-terminated string with [`libc::malloc`]
+///
+/// # Safety
+///
+/// Same as [`libc::malloc`]
+unsafe fn malloc_cstr(str: &CStr) -> Option<&'static mut [i8]> {
+    fn cast(i: &[u8]) -> &[i8] {
+        // SAFETY: u8 and i8 have the same binary representation
+        unsafe { std::slice::from_raw_parts(i.as_ptr() as *const _, i.len()) }
+    }
+    let str = cast(str.to_bytes_with_nul());
+    // SAFETY: caller must ensure the safety requirements of malloc
+    let slice = unsafe { malloc(str.len()) }?;
+    Some(slice.write_copy_of_slice(str))
 }
