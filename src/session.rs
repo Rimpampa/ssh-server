@@ -61,15 +61,14 @@ impl Session {
             Some(user) => user,
         };
 
-        // Authenticate and open a PAM session.  This replaces the previous
+        // Authenticate and open a PAM session. This replaces the previous
         // direct /etc/shadow verification and gives the PAM stack (pam_unix,
         // pam_limits, pam_env, …) a chance to run all of its modules.
-        // PamSession::open performs pam_authenticate + pam_acct_mgmt +
-        // pam_open_session; dropping the value later closes the session.
+        // Dropping the value later closes the session.
         let pam = tokio::task::spawn_blocking({
             let name = name.to_owned();
             let password = password.to_owned();
-            move || PamSession::authenticate(&name, &password)
+            move || PamSession::open(&name, &password)
         })
         .await
         .with_context(|| "PAM task panicked")??;
@@ -87,18 +86,6 @@ impl Session {
 
     pub fn user(&self) -> &uzers::User {
         &self.user
-    }
-
-    /// Returns the `pre_exec` closure that opens the PAM session in the child
-    /// process. Must be called after a successful [`authorize`].
-    ///
-    /// # Panics
-    /// Panics if called before the user has been authenticated.
-    pub fn pam_child_setup(&self) -> impl FnMut() -> std::io::Result<()> + Send + 'static {
-        self.pam_session
-            .as_ref()
-            .expect("pam_child_setup called before authorize")
-            .child_setup()
     }
 
     pub fn name(&self) -> &str {
