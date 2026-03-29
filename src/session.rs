@@ -8,7 +8,7 @@ use tokio::process::Command;
 use anyhow::Context;
 
 use crate::crypt;
-use crate::pam_auth::PamSession;
+use crate::pam_appl::PamSession;
 
 pub type Database = HashMap<String, Option<SocketAddr>>;
 
