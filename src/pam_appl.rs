@@ -6,16 +6,24 @@
 //!
 //! Lifecycle performed by [`PamSession::open`]:
 //!   `pam_start` → `pam_authenticate` → `pam_acct_mgmt` →
-//!   `pam_setcred(ESTABLISH)` → `pam_open_session` → `pam_setcred(REINITIALIZE)`
+//!   `pam_setcred(ESTABLISH)` → `pam_open_session`
 //!
 //! [`Drop`] runs:
 //!   `pam_close_session` → `pam_setcred(DELETE)` → `pam_end`
+//!
+
+// pam_limits    | Applies resource limits (ulimits) from /etc/security/limits.conf
+// pam_mkhomedir | Creates home directory on first login if it doesn't exist
+// pam_unix      | Core Unix auth — checks passwords against /etc/shadow
+// pam_localuser | Succeeds only if user exists in local /etc/passwd
+// pam_exec      | Runs an arbitrary external command during auth
+
 
 #![allow(non_upper_case_globals)]
 
-use std::ffi::{CStr, CString};
+use std::ffi::*;
 use std::mem::{MaybeUninit, size_of};
-use std::os::raw::{c_int, c_void};
+use std::net::SocketAddr;
 use std::ptr::{self, NonNull};
 
 mod ffi {
@@ -102,8 +110,6 @@ unsafe extern "C" fn conversation(
     ffi::PAM_SUCCESS as c_int
 }
 
-// ── PamSession ────────────────────────────────────────────────────────────────
-
 /// An open PAM session for an authenticated user.
 ///
 /// Created via [`PamSession::open`]. Dropping this value closes the session
@@ -120,6 +126,13 @@ pub struct PamSession {
 // SAFETY: the PAM handle is owned exclusively by this struct; we never share
 // it across threads and all access is through exclusive ownership.
 unsafe impl Send for PamSession {}
+
+macro_rules! pam {
+    ($self:expr, $fn:expr, $($param:expr),* $(,)?) => {{
+        let res = $fn($self.handle, $($param),*);
+        $self.result(stringify!($fn), res)
+    }}
+}
 
 impl PamSession {
     fn null(username: &str, password: &str) -> anyhow::Result<Self> {
@@ -154,19 +167,18 @@ impl PamSession {
         str.to_str().unwrap_or("* invalid *")
     }
 
-    fn result(&mut self, step: &str, result: c_int) -> anyhow::Result<&mut Self> {
+    fn result(&mut self, step: &str, result: c_int) -> anyhow::Result<()> {
         self.status = result.cast_unsigned();
-        if self.status == ffi::PAM_SUCCESS {
-            log::debug!("PAM {step}: ok");
-        } else {
-            log::debug!("PAM {step}: failed — {}", self.status_str());
-        }
+        log::debug!("{step}: {}", self.status_str());
         anyhow::ensure!(self.status == ffi::PAM_SUCCESS, self.status_str());
-        Ok(self)
+        Ok(())
     }
 
-    fn start(&mut self) -> anyhow::Result<&mut Self> {
-        // SAFETY: todo
+    /// Starts a PAM session with the "ssh-server" service
+    fn start(&mut self) -> anyhow::Result<()> {
+        // SAFETY:
+        // - `service_name` is a null-terminated byte string
+        // - `username` is a null-terminated byte string
         let res = unsafe {
             ffi::pam_start(
                 c"ssh-server".as_ptr(),
@@ -175,61 +187,62 @@ impl PamSession {
                 &mut self.handle,
             )
         };
-        self.result("pam_start", res)
+        self.result("ffi::pam_start", res)
     }
 
-    fn authenticate_(&mut self) -> anyhow::Result<&mut Self> {
+    /// Sets a PAM item that is expected to be a C string.
+    ///
+    /// # Safety
+    ///
+    /// The selected `item` must be one that Linux-PAM expects to be a C string (e.g. `PAM_AUTHTOK` or `PAM_RHOST`).
+    unsafe fn set_cstr_item(&mut self, item: u32, value: impl Into<Vec<u8>>) -> anyhow::Result<()> {
+        let str = CString::new(value)?;
         // SAFETY: todo
-        self.result("pam_authenticate", unsafe {
-            ffi::pam_authenticate(self.handle, 0)
-        })
-    }
-
-    fn acct_mgmt(&mut self) -> anyhow::Result<&mut Self> {
-        // SAFETY: todo
-        self.result("pam_acct_mgmt", unsafe {
-            ffi::pam_acct_mgmt(self.handle, 0)
-        })
-    }
-
-    fn establish_cred(&mut self) -> anyhow::Result<&mut Self> {
-        // SAFETY: todo
-        self.result("pam_setcred(establish)", unsafe {
-            ffi::pam_setcred(self.handle, ffi::PAM_ESTABLISH_CRED as c_int)
-        })
-    }
-
-    fn open_session(&mut self) -> anyhow::Result<&mut Self> {
-        // SAFETY: todo
-        self.result("pam_open_session", unsafe {
-            ffi::pam_open_session(self.handle, 0)
-        })
-    }
-
-    fn reinitialize_cred(&mut self) -> anyhow::Result<&mut Self> {
-        // SAFETY: todo
-        self.result("pam_setcred(reinitialize)", unsafe {
-            ffi::pam_setcred(self.handle, ffi::PAM_REINITIALIZE_CRED as c_int)
-        })
+        unsafe {
+            pam!(
+                self,
+                ffi::pam_set_item,
+                item.cast_signed(),
+                str.as_ptr() as *const _
+            )
+        }
     }
 
     /// Authenticate `username`/`password` against the `"ssh-server"` PAM service
     /// and open a session.
     ///
     /// Runs `pam_start` → `pam_authenticate` → `pam_acct_mgmt` →
-    /// `pam_setcred(ESTABLISH)` → `pam_open_session` → `pam_setcred(REINITIALIZE)`.
+    /// `pam_setcred(ESTABLISH)` → `pam_open_session`.
     /// Dropping the returned value closes the session via `pam_close_session`,
     /// `pam_setcred(DELETE)`, and `pam_end`.
-    pub fn open(username: &str, password: &str) -> anyhow::Result<Self> {
-        let mut handle = Self::null(username, password)?;
-        handle
-            .start()?
-            .authenticate_()?
-            .acct_mgmt()?
-            .establish_cred()?
-            .open_session()?
-            .reinitialize_cred()?;
-        Ok(handle)
+    pub fn open(username: &str, password: &str, host: SocketAddr) -> anyhow::Result<Self> {
+        let mut session = Self::null(username, password)?;
+        session.start()?;
+        unsafe extern "C" fn nodelay(_: c_int, _: c_uint, _: *const c_void) {}
+        // SAFETY: todo
+        unsafe {
+            pam!(
+                session,
+                ffi::pam_set_item,
+                ffi::PAM_FAIL_DELAY.cast_signed(),
+                nodelay as *const _
+            )
+        }?;
+        // SAFETY: todo
+        unsafe { session.set_cstr_item(ffi::PAM_AUTHTOK, password) }?;
+        // SAFETY: todo
+        unsafe { session.set_cstr_item(ffi::PAM_RHOST, username) }?;
+        // SAFETY: todo
+        unsafe { session.set_cstr_item(ffi::PAM_RHOST, host.to_string()) }?;
+        // SAFETY: todo
+        unsafe { pam!(session, ffi::pam_authenticate, 0) }?;
+        // SAFETY: todo
+        unsafe { pam!(session, ffi::pam_acct_mgmt, 0) }?;
+        // SAFETY: todo
+        unsafe { pam!(session, ffi::pam_setcred, ffi::PAM_ESTABLISH_CRED as c_int) }?;
+        // SAFETY: todo
+        unsafe { pam!(session, ffi::pam_open_session, 0) }?;
+        Ok(session)
     }
 }
 
