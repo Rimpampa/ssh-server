@@ -38,11 +38,7 @@ impl Session {
         }
     }
 
-    pub async fn authorize(
-        &mut self,
-        name: &str,
-        password: &str,
-    ) -> anyhow::Result<()> {
+    pub async fn authorize(&mut self, name: &str, password: &str) -> anyhow::Result<()> {
         let name = name.trim();
         if name == "root" {
             anyhow::bail!("root login is not allowed")
@@ -51,7 +47,8 @@ impl Session {
         self.user = match uzers::get_user_by_name(name) {
             None => {
                 create(name, password).await?;
-                uzers::get_user_by_name(name).with_context(|| "create function somehow failed without error")?
+                uzers::get_user_by_name(name)
+                    .with_context(|| "create function somehow failed without error")?
             }
             Some(user) => {
                 verify(name, password).await?;
@@ -62,9 +59,7 @@ impl Session {
 
         let mut lock = self.db.lock().unwrap();
         match lock.entry(name.into()).or_default() {
-            Some(addr) => anyhow::bail!(
-                "Already logged-in from {addr}",
-            ),
+            Some(addr) => anyhow::bail!("Already logged-in from {addr}",),
             entry @ None => *entry = Some(self.addr),
         }
         Ok(())
@@ -94,22 +89,21 @@ impl Drop for Session {
 
 /// Create a new user in the OS and set its password in /etc/shadow
 async fn create(name: &str, password: &str) -> anyhow::Result<()> {
-    let child = Command::new("useradd").arg("-m").arg(name).status().await?;
-    if !child.success() {
-        anyhow::bail!("useradd failed")
-    };
-
     let salt = crypt::gensalt(None, 0, None).with_context(|| "Salt generation failed")?;
     let password = CString::new(password)?;
     let password = crypt::crypt(&password, &salt).with_context(|| "Password hashing failed")?;
     let password = password
         .into_string()
         .with_context(|| "Password conversion failed")?;
-    let password = format!("{name}:{password}:");
 
-    let shadow = tokio::fs::read_to_string("/etc/shadow").await?;
-    let shadow = shadow.replace(&format!("{name}:!:"), &password);
-    tokio::fs::write("/etc/shadow", shadow).await?;
+    // TODO: from useradd(8)
+    // Note: This option is not recommended because the password (or encrypted password)
+    //       will be visible by users listing the processes.
+    let child = Command::new("useradd")
+        .args(["-m", name, "-p", &password])
+        .status()
+        .await?;
+    anyhow::ensure!(child.success(), "useradd failed");
     Ok(())
 }
 
