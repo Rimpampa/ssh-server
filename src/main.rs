@@ -1,5 +1,5 @@
 mod crypt;
-mod pam_auth;
+mod pam_appl;
 mod session;
 
 use anyhow::Context;
@@ -106,6 +106,7 @@ impl Handler for Connection {
         self.read = Some(read);
 
         let user = self.session.user();
+        let pam_setup = self.session.pam_child_setup();
         let command = pty_process::Command::new(user.shell())
             .arg("-i")
             .uid(user.uid())
@@ -116,6 +117,7 @@ impl Handler for Connection {
             .env("USER", user.name())
             .env("LOGNAME", user.name())
             .env("SHELL", user.shell());
+        let command = unsafe { command.pre_exec(pam_setup) };
         self.child = Some(command.spawn(pts)?);
 
         info!("[{}] Authenticated", self.session.log());
