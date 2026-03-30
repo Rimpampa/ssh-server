@@ -6,6 +6,8 @@ COPY Cargo.toml ./
 COPY build.rs ./
 COPY src/  ./src/
 
+RUN apt-get update && apt-get install -y libclang-dev
+
 RUN cargo build --release
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
