@@ -3,6 +3,9 @@ name = "ssh-server"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["ssh-user"]
+
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"

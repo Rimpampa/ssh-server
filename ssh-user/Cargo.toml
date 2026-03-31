@@ -1,0 +1,13 @@
+[package]
+name = "ssh-user"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+rpassword = "7.4.0"
+pty-process = "0.5.3"
+uzers = "0.12"
+
+[build-dependencies]
+bindgen = "0.71.0"

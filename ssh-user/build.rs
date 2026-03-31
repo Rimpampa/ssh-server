@@ -1,16 +1,16 @@
 use std::{env, path::PathBuf};
 
 fn main() {
-    println!("cargo:rustc-link-lib=crypt");
+    println!("cargo:rustc-link-lib=pam");
 
     let bindings = bindgen::Builder::default()
-        .header("src/crypt.h")
+        .header("src/pam_appl.h")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .generate()
         .expect("Unable to generate bindings");
 
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
     bindings
-        .write_to_file(out_path.join("crypt.rs"))
+        .write_to_file(out_path.join("pam_appl.rs"))
         .expect("Couldn't write bindings!");
 }
