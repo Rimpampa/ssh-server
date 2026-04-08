@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["ssh-user"]
+members = ["ssh-user", "crypt_sys", "pam_sys"]
 
 [dependencies]
 anyhow = "1.0"
@@ -13,6 +13,7 @@ uzers = "0.12"
 log = "0.4"
 env_logger = "0.11"
 libc = "0.2"
+crypt_sys = { path = "crypt_sys" }
 
 [dependencies.pty-process]
 version = "0.5.3"
@@ -26,6 +27,3 @@ features = ["ring"]
 [dependencies.tokio]
 version = "1.49"
 features = ["full"]
-
-[build-dependencies]
-bindgen = "0.71.0"

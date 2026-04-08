@@ -1,29 +1,53 @@
-use anyhow::Context;
+use std::{os::unix::process::CommandExt, process::Command};
+
 use uzers::os::unix::UserExt;
 
-mod pam_appl;
+mod pam;
+mod crypt;
 
-fn main() -> anyhow::Result<()> {
-    let username = std::env::args().nth(1).with_context(|| "[DEV] Missing usarname!")?;
-    let password = rpassword::prompt_password(format!("{username}'s password: ")).with_context(|| "[DEV] During password prompt...")?;
+fn main() {
+    let mut args = std::env::args().skip(1);
+    let username = args.next().unwrap();
+    let host = args.next().unwrap();
 
-    let user = uzers::get_user_by_name(&username).with_context(|| "[DEV] User does not exist!")?;
+    let (user, password) = match uzers::get_user_by_name(&username) {
+        Some(user) => (user, rpassword::prompt_password(format!("{username}'s password: ")).unwrap()),
+        None => new_user(&username),
+    };
 
-    let _session = pam_appl::Session::open(&username, &password)?;
+    let _session = pam::Session::open(&username, &password, &host).unwrap();
 
-    let (_pty, pts) = pty_process::blocking::open()?;
-
-    pty_process::blocking::Command::new(user.shell())
+    Command::new(user.shell())
         .arg("-i")
-        .uid(user.uid())
         .gid(user.primary_group_id())
+        .uid(user.uid())
         .current_dir(user.home_dir())
-        // .env("TERM", self.term.as_deref().unwrap_or("xterm-256color"))
+        .env("TERM", "xterm-256color")
         .env("HOME", user.home_dir())
         .env("USER", user.name())
         .env("LOGNAME", user.name())
         .env("SHELL", user.shell())
-        .spawn(pts)?;
+        .status()
+        .unwrap();
+}
 
-    Ok(())
+fn new_user(username: &str) -> (uzers::User, String) {
+    let password = rpassword::prompt_password(format!("New {username}'s password: ")).unwrap();
+    let repeat = rpassword::prompt_password(format!("Repeat password: ")).unwrap();
+    assert!(password == repeat);
+
+    let salt = crypt::gensalt(None, 0, None).unwrap();
+    let password = std::ffi::CString::new(password).unwrap();
+    let password = crypt::crypt(&password, &salt).unwrap();
+    let password = password
+        .into_string().unwrap();
+
+    // TODO: from useradd(8)
+    // Note: This option is not recommended because the password (or encrypted password)
+    //       will be visible by users listing the processes.
+    Command::new("useradd")
+        .args(["-m", username, "-p", &password])
+        .status().unwrap();
+
+    (uzers::get_user_by_name(username).unwrap(), password)
 }

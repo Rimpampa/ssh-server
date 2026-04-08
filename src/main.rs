@@ -1,5 +1,3 @@
-mod crypt;
-mod pam_appl;
 mod session;
 
 use anyhow::Context;
@@ -14,8 +12,6 @@ use russh::{Channel, ChannelId, CryptoVec};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-
-use uzers::os::unix::UserExt;
 
 use log::{debug, error, info, warn};
 
@@ -94,8 +90,8 @@ impl Connection {
 impl Handler for Connection {
     type Error = anyhow::Error;
 
-    async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
-        if let Err(e) = self.session.authorize(user, password).await {
+    async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
+        if let Err(e) = self.session.authorize(user).await {
             warn!("[{}] Authentication failed with: {e}", self.session.log());
             return Ok(Auth::reject());
         };
@@ -106,22 +102,14 @@ impl Handler for Connection {
         self.read = Some(read);
 
         let user = self.session.user();
-        let pam_setup = self.session.pam_child_setup();
-        let command = pty_process::Command::new(user.shell())
-            .arg("-i")
-            .uid(user.uid())
-            .gid(user.primary_group_id())
-            .current_dir(user.home_dir())
-            .env("TERM", self.term.as_deref().unwrap_or("xterm-256color"))
-            .env("HOME", user.home_dir())
-            .env("USER", user.name())
-            .env("LOGNAME", user.name())
-            .env("SHELL", user.shell());
-        let command = unsafe { command.pre_exec(pam_setup) };
+        let command = pty_process::Command::new("./ssh-user")
+            .arg(user)
+            .arg(self.session.addr().to_string());
         self.child = Some(command.spawn(pts)?);
 
         info!("[{}] Authenticated", self.session.log());
         Ok(Auth::Accept)
+
     }
 
     async fn pty_request(
