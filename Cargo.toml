@@ -3,12 +3,16 @@ name = "ssh-server"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["crypt-sys"]
+
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
 uzers = "0.12"
 log = "0.4"
 env_logger = "0.11"
+crypt-sys = { path = "crypt-sys" }
 
 [dependencies.pty-process]
 version = "0.5.3"
@@ -22,6 +26,3 @@ features = ["ring"]
 [dependencies.tokio]
 version = "1.49"
 features = ["full"]
-
-[build-dependencies]
-bindgen = "0.71.0"

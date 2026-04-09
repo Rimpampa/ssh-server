@@ -1,0 +1,10 @@
+[package]
+name = "ssh-user"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rpassword = "7.4.0"
+uzers = "0.12"
+pam_sys = { path = "../pam-sys" }
+crypt_sys = { path = "../crypt-sys" }
