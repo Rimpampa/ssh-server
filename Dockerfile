@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 RUN cargo build --release
+RUN cargo build --release --package ssh-user
 
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
@@ -59,6 +60,7 @@ WORKDIR /app
 
 # Copy the binary from builder stage (statically linked musl binary)
 COPY --from=builder /build/target/release/ssh-server /app/ssh-server
+COPY --from=builder /build/target/release/ssh-user   /app/ssh-user
 
 # Set executable permissions
 RUN chmod +x /app/ssh-server
