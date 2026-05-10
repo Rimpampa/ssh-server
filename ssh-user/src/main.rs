@@ -37,21 +37,25 @@ fn main() {
 
 fn new_user(username: &str) -> (uzers::User, String) {
     let password = rpassword::prompt_password(format!("New {username}'s password: ")).unwrap();
-    let repeat = rpassword::prompt_password(format!("Repeat password: ")).unwrap();
+    let repeat = rpassword::prompt_password("Repeat password: ").unwrap();
     assert!(password == repeat);
 
-    let salt = crypt::gensalt(None, 0, None).unwrap();
-    let password = std::ffi::CString::new(password).unwrap();
-    let password = crypt::crypt(&password, &salt).unwrap();
-    let password = password.into_string().unwrap();
-
-    // TODO: from useradd(8)
-    // Note: This option is not recommended because the password (or encrypted password)
-    //       will be visible by users listing the processes.
-    Command::new("useradd")
-        .args(["-m", username, "-p", &password])
+    let status = Command::new("useradd")
+        .args(["-m", username])
         .status()
         .unwrap();
+    assert!(status.success(), "useradd failed!");
+
+    let (output, mut input) = pipe().unwrap();
+    let mut child = Command::new("chpasswd").stdin(output).spawn().unwrap();
+
+    let data = format!("{username}:{password}");
+    input.write_all(data.as_bytes()).unwrap();
+
+    drop(input);
+
+    let status = child.wait().unwrap();
+    assert!(status.success(), "chpasswd failed!");
 
     (uzers::get_user_by_name(username).unwrap(), password)
 }
