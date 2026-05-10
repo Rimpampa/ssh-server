@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["ssh-user", "crypt-sys", "pam-sys"]
+members = ["ssh-user", "pam-sys"]
 
 [dependencies]
 anyhow = "1.0"

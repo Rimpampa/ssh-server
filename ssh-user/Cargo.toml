@@ -7,4 +7,3 @@ edition = "2024"
 rpassword = "7.4.0"
 uzers = "0.12"
 pam-sys = { path = "../pam-sys" }
-crypt-sys = { path = "../crypt-sys" }

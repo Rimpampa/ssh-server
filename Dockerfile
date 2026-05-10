@@ -4,13 +4,11 @@ WORKDIR /build
 
 COPY Cargo.toml ./
 COPY src/ ./src/
-COPY crypt-sys/ ./crypt-sys/
 COPY pam-sys/ ./pam-sys/
 COPY ssh-user/ ./ssh-user/
 
 # Install build dependencies: libcrypt-dev for crypt bindings, libpam0g-dev for PAM
 RUN apt-get update && apt-get install -y \
-    libcrypt-dev \
     libpam0g-dev \
     libclang-dev \
     && rm -rf /var/lib/apt/lists/*

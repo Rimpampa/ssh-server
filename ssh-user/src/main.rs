@@ -3,7 +3,6 @@ use std::{os::unix::process::CommandExt, process::Command};
 
 use uzers::os::unix::UserExt;
 
-mod crypt;
 mod pam;
 
 fn main() {
