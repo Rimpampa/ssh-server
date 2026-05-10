@@ -6,5 +6,5 @@ edition = "2024"
 [dependencies]
 rpassword = "7.4.0"
 uzers = "0.12"
-pam_sys = { path = "../pam-sys" }
-crypt_sys = { path = "../crypt-sys" }
+pam-sys = { path = "../pam-sys" }
+crypt-sys = { path = "../crypt-sys" }

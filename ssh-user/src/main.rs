@@ -1,9 +1,10 @@
+use std::io::{Write, pipe};
 use std::{os::unix::process::CommandExt, process::Command};
 
 use uzers::os::unix::UserExt;
 
-mod pam;
 mod crypt;
+mod pam;
 
 fn main() {
     let mut args = std::env::args().skip(1);
