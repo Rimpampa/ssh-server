@@ -21,7 +21,7 @@ pub struct Session {
     handle: *mut pam_handle_t,
     status: u32,
     _psw: Box<CStr>,
-    _conv: Box<pam_conv>,
+    conv: Box<pam_conv>,
 }
 
 // SAFETY: the PAM handle is owned exclusively by this struct; we never share
@@ -65,9 +65,9 @@ impl Session {
         // - `username` is a null-terminated byte string
         let res = unsafe {
             pam_start(
-                c"ssh-server".as_ptr(),
+                c"sshd".as_ptr(),
                 user.as_ptr(),
-                &*self._conv,
+                &*self.conv,
                 &mut self.handle,
             )
         };
@@ -104,7 +104,7 @@ impl Session {
         let mut session = Self {
             handle: std::ptr::null_mut(),
             status: PAM_SUCCESS,
-            _conv: Box::new(pam_conv {
+            conv: Box::new(pam_conv {
                 conv: Some(conv),
                 appdata_ptr: _psw.as_ptr() as _,
             }),
